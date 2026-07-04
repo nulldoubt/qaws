@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const qaws_version = "0.1.0";
+const qaws_version = "0.2.0";
 
 const ReleaseTarget = struct {
     triple: []const u8,

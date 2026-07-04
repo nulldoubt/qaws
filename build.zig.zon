@@ -1,6 +1,6 @@
 .{
     .name = .qaws,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x12a076458481ac0b,
     .minimum_zig_version = "0.16.0",
     .paths = .{
@@ -10,6 +10,7 @@
         "src",
         "public",
         "scripts",
+        "CHANGELOG.md",
         "README.md",
     },
 }

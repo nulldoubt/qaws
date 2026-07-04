@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 
-const version = "0.1.0";
+const version = "0.2.0";
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 
