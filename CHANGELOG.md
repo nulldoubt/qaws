@@ -2,6 +2,7 @@
 
 ### 0.2.0
 
+- Added explicit strict JSON configuration with CLI overrides and a `qaws check` command.
 - Added plain and JSON-lines logging with default access logs and log-file support.
 - Bumped qaws version metadata and documentation to 0.2.0.
 

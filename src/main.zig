@@ -22,12 +22,78 @@ const Config = struct {
     log_format: LogFormat = .plain,
     log_file: ?[]const u8 = null,
     access_log: bool = true,
+    pid_file: ?[]const u8 = null,
+    dotfiles: DotfilePolicy = .deny_except_well_known,
+    last_modified: bool = true,
+    trailing_slash_redirect: bool = true,
 };
 
 const ParsedCommand = union(enum) {
     serve: Config,
+    check: Config,
     help,
     version,
+};
+
+const CliCommand = enum {
+    serve,
+    check,
+    help,
+    version,
+};
+
+const CliOptions = struct {
+    command: CliCommand = .serve,
+    config_path: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+    serve_dir: ?[]const u8 = null,
+    daemon: ?bool = null,
+    log_format: ?LogFormat = null,
+    log_file: ?[]const u8 = null,
+    access_log: ?bool = null,
+    pid_file: ?[]const u8 = null,
+};
+
+const FileConfig = struct {
+    listen: ?ListenConfig = null,
+    serve: ?[]const u8 = null,
+    daemon: ?DaemonConfig = null,
+    logging: ?LoggingConfig = null,
+    security: ?SecurityConfig = null,
+    headers: ?std.json.Value = null,
+    http: ?HttpConfig = null,
+};
+
+const ListenConfig = struct {
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
+const DaemonConfig = struct {
+    enabled: ?bool = null,
+    pid_file: ?[]const u8 = null,
+    log_file: ?[]const u8 = null,
+};
+
+const LoggingConfig = struct {
+    format: ?LogFormat = null,
+    access: ?bool = null,
+};
+
+const DotfilePolicy = enum {
+    deny_except_well_known,
+    deny_all,
+    allow,
+};
+
+const SecurityConfig = struct {
+    dotfiles: ?DotfilePolicy = null,
+};
+
+const HttpConfig = struct {
+    last_modified: ?bool = null,
+    trailing_slash_redirect: ?bool = null,
 };
 
 const Request = struct {
@@ -212,14 +278,22 @@ pub fn main(init: std.process.Init) !void {
     const loaded_args = try loadArgs(allocator, io, init.minimal.args);
     defer loaded_args.deinit(allocator);
 
-    const command = parseArgs(loaded_args.args) catch |err| {
+    const cli = parseCli(loaded_args.args) catch |err| {
         try printCliError(err);
+        std.process.exit(2);
+    };
+
+    var config_arena = std.heap.ArenaAllocator.init(allocator);
+    defer config_arena.deinit();
+    const command = resolveCommand(config_arena.allocator(), io, cli) catch |err| {
+        try printConfigError(err);
         std.process.exit(2);
     };
 
     switch (command) {
         .help => try printHelp(),
         .version => try printVersion(),
+        .check => |config| try checkConfig(io, config),
         .serve => |raw_config| {
             var config = raw_config;
             var owned_serve_dir: ?[:0]u8 = null;
@@ -308,7 +382,20 @@ fn copyInitArgs(allocator: Allocator, init_args: std.process.Args) !LoadedArgs {
 }
 
 fn parseArgs(args: []const []const u8) CliError!ParsedCommand {
+    const cli = try parseCli(args);
     var config = Config{};
+    applyCliOverrides(&config, cli);
+
+    return switch (cli.command) {
+        .serve => .{ .serve = config },
+        .check => .{ .check = config },
+        .help => .help,
+        .version => .version,
+    };
+}
+
+fn parseCli(args: []const []const u8) CliError!CliOptions {
+    var cli = CliOptions{};
     var i: usize = initialArgIndex(args);
 
     while (i < args.len) : (i += 1) {
@@ -319,46 +406,154 @@ fn parseArgs(args: []const []const u8) CliError!ParsedCommand {
             const value = normalizeArg(args[i]);
             const parsed = std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
             if (parsed == 0) return error.InvalidPort;
-            config.port = parsed;
+            cli.port = parsed;
         } else if (std.mem.eql(u8, arg, "--log-format")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             const value = normalizeArg(args[i]);
             if (std.mem.eql(u8, value, "plain")) {
-                config.log_format = .plain;
+                cli.log_format = .plain;
             } else if (std.mem.eql(u8, value, "jsonl")) {
-                config.log_format = .jsonl;
+                cli.log_format = .jsonl;
             } else {
                 return error.InvalidLogFormat;
             }
         } else if (std.mem.eql(u8, arg, "--host")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
-            config.host = normalizeArg(args[i]);
+            cli.host = normalizeArg(args[i]);
         } else if (std.mem.eql(u8, arg, "--serve")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
-            config.serve_dir = normalizeArg(args[i]);
+            cli.serve_dir = normalizeArg(args[i]);
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.config_path = normalizeArg(args[i]);
         } else if (std.mem.eql(u8, arg, "--log-file")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
-            config.log_file = normalizeArg(args[i]);
+            cli.log_file = normalizeArg(args[i]);
+        } else if (std.mem.eql(u8, arg, "--pid-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.pid_file = normalizeArg(args[i]);
         } else if (std.mem.eql(u8, arg, "--access-log")) {
-            config.access_log = true;
+            cli.access_log = true;
         } else if (std.mem.eql(u8, arg, "--no-access-log")) {
-            config.access_log = false;
+            cli.access_log = false;
         } else if (std.mem.eql(u8, arg, "-d")) {
-            config.daemon = true;
+            cli.daemon = true;
+        } else if (std.mem.eql(u8, arg, "check")) {
+            cli.command = .check;
         } else if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            return .help;
+            cli.command = .help;
         } else if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version")) {
-            return .version;
+            cli.command = .version;
         } else {
             return error.UnknownArgument;
         }
     }
 
-    return .{ .serve = config };
+    return cli;
+}
+
+fn resolveCommand(allocator: Allocator, io: Io, cli: CliOptions) !ParsedCommand {
+    var config = Config{};
+    if (cli.config_path) |path| {
+        try loadConfigFile(allocator, io, path, &config);
+    }
+    applyCliOverrides(&config, cli);
+
+    return switch (cli.command) {
+        .serve => .{ .serve = config },
+        .check => .{ .check = config },
+        .help => .help,
+        .version => .version,
+    };
+}
+
+fn applyCliOverrides(config: *Config, cli: CliOptions) void {
+    if (cli.host) |value| config.host = value;
+    if (cli.port) |value| config.port = value;
+    if (cli.serve_dir) |value| config.serve_dir = value;
+    if (cli.daemon) |value| config.daemon = value;
+    if (cli.log_format) |value| config.log_format = value;
+    if (cli.log_file) |value| config.log_file = value;
+    if (cli.access_log) |value| config.access_log = value;
+    if (cli.pid_file) |value| config.pid_file = value;
+}
+
+fn loadConfigFile(allocator: Allocator, io: Io, path: []const u8, config: *Config) !void {
+    const bytes = try readFileAlloc(allocator, io, path, 1024 * 1024);
+    defer allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(FileConfig, allocator, bytes, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    try applyFileConfig(allocator, parsed.value, config);
+}
+
+fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Config) !void {
+    if (file_config.listen) |listen| {
+        if (listen.host) |host| config.host = try allocator.dupe(u8, host);
+        if (listen.port) |port| {
+            if (port == 0) return error.InvalidPort;
+            config.port = port;
+        }
+    }
+
+    if (file_config.serve) |serve_dir| config.serve_dir = try allocator.dupe(u8, serve_dir);
+
+    if (file_config.daemon) |daemon_config| {
+        if (daemon_config.enabled) |enabled| config.daemon = enabled;
+        if (daemon_config.pid_file) |pid_file| config.pid_file = try allocator.dupe(u8, pid_file);
+        if (daemon_config.log_file) |log_file| config.log_file = try allocator.dupe(u8, log_file);
+    }
+
+    if (file_config.logging) |logging| {
+        if (logging.format) |format| config.log_format = format;
+        if (logging.access) |access| config.access_log = access;
+    }
+
+    if (file_config.security) |security| {
+        if (security.dotfiles) |dotfiles| config.dotfiles = dotfiles;
+    }
+
+    if (file_config.http) |http| {
+        if (http.last_modified) |last_modified| config.last_modified = last_modified;
+        if (http.trailing_slash_redirect) |trailing_slash_redirect| config.trailing_slash_redirect = trailing_slash_redirect;
+    }
+
+    if (file_config.headers) |headers| {
+        if (headers != .object) return error.InvalidHeaderConfig;
+        var it = headers.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .string) return error.InvalidHeaderConfig;
+        }
+    }
+}
+
+fn readFileAlloc(allocator: Allocator, io: Io, path: []const u8, max_bytes: usize) ![]u8 {
+    var file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    while (true) {
+        const n = reader.interface.readSliceShort(&buffer) catch |err| switch (err) {
+            error.ReadFailed => return reader.err orelse err,
+        };
+        if (n == 0) break;
+        if (output.items.len + n > max_bytes) return error.FileTooBig;
+        try output.appendSlice(allocator, buffer[0..n]);
+    }
+    return try output.toOwnedSlice(allocator);
 }
 
 fn normalizeArg(arg: []const u8) []const u8 {
@@ -443,6 +638,17 @@ fn printCliError(err: CliError) !void {
     try writer.flush();
 }
 
+fn printConfigError(err: anyerror) !void {
+    const stderr = std.Io.File.stderr();
+    var buffer: [512]u8 = undefined;
+    var writer = stderr.writer(std.Io.Threaded.global_single_threaded.io(), &buffer);
+    const out = &writer.interface;
+
+    try out.print("qaws: configuration error: {s}\n", .{@errorName(err)});
+    try out.writeAll("Run `qaws help` for usage.\n");
+    try writer.flush();
+}
+
 fn printHelp() !void {
     const stdout = std.Io.File.stdout();
     var buffer: [1024]u8 = undefined;
@@ -454,6 +660,7 @@ fn printHelp() !void {
         \\
         \\Usage:
         \\  qaws [--host <addr>] [--port <port>] [--serve <directory>] [-d]
+        \\  qaws check --config <file>
         \\  qaws help
         \\  qaws version
         \\
@@ -463,8 +670,10 @@ fn printHelp() !void {
         \\  --serve ./public
         \\
         \\Options:
+        \\  --config <path>
         \\  --log-format plain|jsonl
         \\  --log-file <path>
+        \\  --pid-file <path>
         \\  --access-log
         \\  --no-access-log
         \\
@@ -479,6 +688,21 @@ fn printVersion() !void {
     const out = &writer.interface;
 
     try out.print("qaws {s}\n", .{version});
+    try writer.flush();
+}
+
+fn checkConfig(io: Io, config: Config) !void {
+    var root = try Io.Dir.cwd().openDir(io, config.serve_dir, .{});
+    root.close(io);
+
+    const stdout = std.Io.File.stdout();
+    var buffer: [256]u8 = undefined;
+    var writer = stdout.writer(io, &buffer);
+    try writer.interface.print("qaws: configuration ok ({s} on {s}:{d})\n", .{
+        config.serve_dir,
+        config.host,
+        config.port,
+    });
     try writer.flush();
 }
 
@@ -905,6 +1129,11 @@ test "parse cli commands" {
 
     const dash_help_args: []const [:0]const u8 = &.{ "qaws", "--help" };
     try std.testing.expectEqual(ParsedCommand.help, try parseArgs(dash_help_args));
+
+    const check_args: []const [:0]const u8 = &.{ "qaws", "check", "--config", "qaws.json" };
+    const cli = try parseCli(check_args);
+    try std.testing.expectEqual(CliCommand.check, cli.command);
+    try std.testing.expectEqualStrings("qaws.json", cli.config_path.?);
 }
 
 test "parse cli serve options" {
@@ -960,4 +1189,71 @@ test "json log string escaping" {
 
     try appendJsonString(&output, allocator, "a\"b\\c\n");
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", output.items);
+}
+
+test "json config applies values and cli overrides" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "listen": { "host": "127.0.0.1", "port": 8080 },
+        \\  "serve": "site",
+        \\  "daemon": { "enabled": true, "pid_file": "qaws.pid", "log_file": "qaws.log" },
+        \\  "logging": { "format": "jsonl", "access": false },
+        \\  "security": { "dotfiles": "deny_all" },
+        \\  "headers": { "Cache-Control": "public, max-age=60" },
+        \\  "http": { "last_modified": false, "trailing_slash_redirect": false }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(FileConfig, allocator, json, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var config = Config{};
+    try applyFileConfig(arena.allocator(), parsed.value, &config);
+    try std.testing.expectEqualStrings("127.0.0.1", config.host);
+    try std.testing.expectEqual(@as(u16, 8080), config.port);
+    try std.testing.expectEqualStrings("site", config.serve_dir);
+    try std.testing.expect(config.daemon);
+    try std.testing.expectEqualStrings("qaws.pid", config.pid_file.?);
+    try std.testing.expectEqualStrings("qaws.log", config.log_file.?);
+    try std.testing.expectEqual(LogFormat.jsonl, config.log_format);
+    try std.testing.expect(!config.access_log);
+    try std.testing.expectEqual(DotfilePolicy.deny_all, config.dotfiles);
+    try std.testing.expect(!config.last_modified);
+    try std.testing.expect(!config.trailing_slash_redirect);
+
+    applyCliOverrides(&config, .{
+        .host = "0.0.0.0",
+        .port = 9090,
+        .serve_dir = "public",
+        .access_log = true,
+    });
+    try std.testing.expectEqualStrings("0.0.0.0", config.host);
+    try std.testing.expectEqual(@as(u16, 9090), config.port);
+    try std.testing.expectEqualStrings("public", config.serve_dir);
+    try std.testing.expect(config.access_log);
+}
+
+test "json config rejects unknown keys and invalid headers" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnknownField,
+        std.json.parseFromSlice(FileConfig, allocator, "{ \"unknown\": true }", .{
+            .ignore_unknown_fields = false,
+        }),
+    );
+
+    var parsed = try std.json.parseFromSlice(FileConfig, allocator, "{ \"headers\": { \"X-Test\": 123 } }", .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+
+    var config = Config{};
+    try std.testing.expectError(error.InvalidHeaderConfig, applyFileConfig(allocator, parsed.value, &config));
 }
