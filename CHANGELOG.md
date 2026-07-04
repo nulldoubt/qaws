@@ -2,6 +2,7 @@
 
 ### 0.2.0
 
+- Updated release documentation and generated SHA256 checksums for release artifacts.
 - Added PID-file daemon management with `status`, `stop`, `restart`, stale detection, and `stop --force`.
 - Added safer static serving with dotfile protection, custom headers, nosniff, Last-Modified/304, and slash redirects.
 - Added explicit strict JSON configuration with CLI overrides and a `qaws check` command.
