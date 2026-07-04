@@ -9,11 +9,19 @@ const version = "0.2.0";
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 
+const LogFormat = enum {
+    plain,
+    jsonl,
+};
+
 const Config = struct {
     host: []const u8 = "0.0.0.0",
     port: u16 = 80,
     serve_dir: []const u8 = "./public",
     daemon: bool = false,
+    log_format: LogFormat = .plain,
+    log_file: ?[]const u8 = null,
+    access_log: bool = true,
 };
 
 const ParsedCommand = union(enum) {
@@ -25,6 +33,7 @@ const ParsedCommand = union(enum) {
 const Request = struct {
     method: []const u8,
     target: []const u8,
+    user_agent: ?[]const u8 = null,
 };
 
 const ResponseStatus = struct {
@@ -32,9 +41,25 @@ const ResponseStatus = struct {
     reason: []const u8,
 };
 
+const ResponseResult = struct {
+    status: u16,
+    bytes: u64,
+};
+
+const AccessRecord = struct {
+    remote: []const u8,
+    method: []const u8,
+    target: []const u8,
+    status: u16,
+    bytes: u64,
+    duration_us: i64,
+    user_agent: ?[]const u8,
+};
+
 const CliError = error{
     MissingValue,
     InvalidPort,
+    InvalidLogFormat,
     UnknownArgument,
 };
 
@@ -49,6 +74,135 @@ const LoadedArgs = struct {
         }
         if (self.bytes) |bytes| allocator.free(bytes);
         allocator.free(self.args);
+    }
+};
+
+const Logger = struct {
+    allocator: Allocator,
+    io: Io,
+    file: Io.File,
+    owns_file: bool,
+    offset: u64 = 0,
+    format: LogFormat,
+    access_enabled: bool,
+
+    fn init(allocator: Allocator, io: Io, config: Config) !Logger {
+        if (config.log_file) |path| {
+            var file = try Io.Dir.cwd().createFile(io, path, .{
+                .truncate = false,
+            });
+            const stat = try file.stat(io);
+            return .{
+                .allocator = allocator,
+                .io = io,
+                .file = file,
+                .owns_file = true,
+                .offset = stat.size,
+                .format = config.log_format,
+                .access_enabled = config.access_log,
+            };
+        }
+
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .file = std.Io.File.stderr(),
+            .owns_file = false,
+            .format = config.log_format,
+            .access_enabled = config.access_log,
+        };
+    }
+
+    fn deinit(self: *Logger) void {
+        if (self.owns_file) {
+            self.file.close(self.io);
+        }
+    }
+
+    fn event(self: *Logger, level: []const u8, comptime fmt: []const u8, args: anytype) !void {
+        var message: std.ArrayList(u8) = .empty;
+        defer message.deinit(self.allocator);
+        try message.print(self.allocator, fmt, args);
+
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.allocator);
+
+        switch (self.format) {
+            .plain => {
+                try appendRfc3339Timestamp(&line, self.allocator, self.io);
+                try line.print(self.allocator, " {s} {s}\n", .{ level, message.items });
+            },
+            .jsonl => {
+                try line.append(self.allocator, '{');
+                try line.appendSlice(self.allocator, "\"ts\":\"");
+                try appendRfc3339Timestamp(&line, self.allocator, self.io);
+                try line.appendSlice(self.allocator, "\",\"level\":");
+                try appendJsonString(&line, self.allocator, level);
+                try line.appendSlice(self.allocator, ",\"message\":");
+                try appendJsonString(&line, self.allocator, message.items);
+                try line.appendSlice(self.allocator, "}\n");
+            },
+        }
+
+        try self.writeLine(line.items);
+    }
+
+    fn access(self: *Logger, record: AccessRecord) void {
+        if (!self.access_enabled) return;
+
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.allocator);
+
+        switch (self.format) {
+            .plain => {
+                appendRfc3339Timestamp(&line, self.allocator, self.io) catch return;
+                line.print(
+                    self.allocator,
+                    " access remote={s} method={s} target=\"{s}\" status={d} bytes={d} duration_us={d}",
+                    .{ record.remote, record.method, record.target, record.status, record.bytes, record.duration_us },
+                ) catch return;
+                if (record.user_agent) |ua| {
+                    line.print(self.allocator, " user_agent=\"{s}\"", .{ua}) catch return;
+                }
+                line.append(self.allocator, '\n') catch return;
+            },
+            .jsonl => {
+                line.append(self.allocator, '{') catch return;
+                line.appendSlice(self.allocator, "\"ts\":\"") catch return;
+                appendRfc3339Timestamp(&line, self.allocator, self.io) catch return;
+                line.appendSlice(self.allocator, "\",\"level\":\"access\",\"remote\":") catch return;
+                appendJsonString(&line, self.allocator, record.remote) catch return;
+                line.appendSlice(self.allocator, ",\"method\":") catch return;
+                appendJsonString(&line, self.allocator, record.method) catch return;
+                line.appendSlice(self.allocator, ",\"target\":") catch return;
+                appendJsonString(&line, self.allocator, record.target) catch return;
+                line.print(self.allocator, ",\"status\":{d},\"bytes\":{d},\"duration_us\":{d}", .{
+                    record.status,
+                    record.bytes,
+                    record.duration_us,
+                }) catch return;
+                if (record.user_agent) |ua| {
+                    line.appendSlice(self.allocator, ",\"user_agent\":") catch return;
+                    appendJsonString(&line, self.allocator, ua) catch return;
+                }
+                line.appendSlice(self.allocator, "}\n") catch return;
+            },
+        }
+
+        self.writeLine(line.items) catch {};
+    }
+
+    fn writeLine(self: *Logger, line: []const u8) !void {
+        if (self.owns_file) {
+            try self.file.writePositionalAll(self.io, line, self.offset);
+            self.offset += line.len;
+            return;
+        }
+
+        var buffer: [2048]u8 = undefined;
+        var writer = self.file.writer(self.io, &buffer);
+        try writer.interface.writeAll(line);
+        try writer.flush();
     }
 };
 
@@ -80,7 +234,10 @@ pub fn main(init: std.process.Init) !void {
                 config.serve_dir = owned_serve_dir.?;
                 try daemonize();
             }
-            try serve(allocator, config);
+
+            var logger = try Logger.init(allocator, io, config);
+            defer logger.deinit();
+            try serve(allocator, config, &logger);
         },
     }
 }
@@ -163,6 +320,17 @@ fn parseArgs(args: []const []const u8) CliError!ParsedCommand {
             const parsed = std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
             if (parsed == 0) return error.InvalidPort;
             config.port = parsed;
+        } else if (std.mem.eql(u8, arg, "--log-format")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            const value = normalizeArg(args[i]);
+            if (std.mem.eql(u8, value, "plain")) {
+                config.log_format = .plain;
+            } else if (std.mem.eql(u8, value, "jsonl")) {
+                config.log_format = .jsonl;
+            } else {
+                return error.InvalidLogFormat;
+            }
         } else if (std.mem.eql(u8, arg, "--host")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -171,6 +339,14 @@ fn parseArgs(args: []const []const u8) CliError!ParsedCommand {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             config.serve_dir = normalizeArg(args[i]);
+        } else if (std.mem.eql(u8, arg, "--log-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            config.log_file = normalizeArg(args[i]);
+        } else if (std.mem.eql(u8, arg, "--access-log")) {
+            config.access_log = true;
+        } else if (std.mem.eql(u8, arg, "--no-access-log")) {
+            config.access_log = false;
         } else if (std.mem.eql(u8, arg, "-d")) {
             config.daemon = true;
         } else if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -201,6 +377,56 @@ fn basename(path: []const u8) []const u8 {
     return path[slash + 1 ..];
 }
 
+fn formatRemoteAddress(address: IpAddress, buffer: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    address.format(&writer) catch return "-";
+    return writer.buffered();
+}
+
+fn appendRfc3339Timestamp(output: *std.ArrayList(u8), allocator: Allocator, io: Io) !void {
+    const now = Io.Timestamp.now(io, .real);
+    const seconds_i = now.toSeconds();
+    const seconds: u64 = if (seconds_i < 0) 0 else @intCast(seconds_i);
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    try output.print(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{
+            year_day.year,
+            @intFromEnum(month_day.month),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
+fn appendJsonString(output: *std.ArrayList(u8), allocator: Allocator, value: []const u8) !void {
+    try output.append(allocator, '"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try output.appendSlice(allocator, "\\\""),
+            '\\' => try output.appendSlice(allocator, "\\\\"),
+            '\n' => try output.appendSlice(allocator, "\\n"),
+            '\r' => try output.appendSlice(allocator, "\\r"),
+            '\t' => try output.appendSlice(allocator, "\\t"),
+            else => {
+                if (byte < 0x20) {
+                    try output.print(allocator, "\\u{X:0>4}", .{byte});
+                } else {
+                    try output.append(allocator, byte);
+                }
+            },
+        }
+    }
+    try output.append(allocator, '"');
+}
+
 fn printCliError(err: CliError) !void {
     const stderr = std.Io.File.stderr();
     var buffer: [512]u8 = undefined;
@@ -210,6 +436,7 @@ fn printCliError(err: CliError) !void {
     switch (err) {
         error.MissingValue => try out.writeAll("qaws: missing value for option\n"),
         error.InvalidPort => try out.writeAll("qaws: port must be a number from 1 to 65535\n"),
+        error.InvalidLogFormat => try out.writeAll("qaws: log format must be plain or jsonl\n"),
         error.UnknownArgument => try out.writeAll("qaws: unknown argument\n"),
     }
     try out.writeAll("Run `qaws help` for usage.\n");
@@ -235,6 +462,12 @@ fn printHelp() !void {
         \\  --port  80
         \\  --serve ./public
         \\
+        \\Options:
+        \\  --log-format plain|jsonl
+        \\  --log-file <path>
+        \\  --access-log
+        \\  --no-access-log
+        \\
     );
     try writer.flush();
 }
@@ -249,7 +482,7 @@ fn printVersion() !void {
     try writer.flush();
 }
 
-fn serve(allocator: Allocator, config: Config) !void {
+fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var root = try Io.Dir.cwd().openDir(io, config.serve_dir, .{});
     defer root.close(io);
@@ -258,17 +491,34 @@ fn serve(allocator: Allocator, config: Config) !void {
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    try logger.event("info", "serving {s} on {s}:{d}", .{ config.serve_dir, config.host, config.port });
+
     while (true) {
         const stream = server.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(allocator, io, root, stream) catch {};
+        handleConnection(allocator, io, root, stream, logger) catch |err| {
+            logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+        };
     }
 }
 
-fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream) !void {
+fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, logger: *Logger) !void {
     defer stream.close(io);
+
+    const start = Io.Timestamp.now(io, .awake);
+    var remote_buffer: [128]u8 = undefined;
+    const remote = formatRemoteAddress(stream.socket.address, &remote_buffer);
+    var access_record = AccessRecord{
+        .remote = remote,
+        .method = "-",
+        .target = "-",
+        .status = 500,
+        .bytes = 0,
+        .duration_us = 0,
+        .user_agent = null,
+    };
 
     var reader_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io, &reader_buffer);
@@ -277,34 +527,55 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
     const out = &writer.interface;
 
     const request_bytes = readHttpRequest(allocator, &reader) catch |err| {
-        switch (err) {
+        const result = switch (err) {
             error.RequestTooLarge => try sendSimple(out, &writer, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n"),
             else => try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n"),
-        }
+        };
+        access_record.status = result.status;
+        access_record.bytes = result.bytes;
+        finishAccessLog(logger, io, start, &access_record);
         return;
     };
     defer allocator.free(request_bytes);
+    defer finishAccessLog(logger, io, start, &access_record);
 
     const request = parseRequest(request_bytes) catch {
-        try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n");
+        const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n");
+        access_record.status = result.status;
+        access_record.bytes = result.bytes;
         return;
     };
+    access_record.method = request.method;
+    access_record.target = request.target;
+    access_record.user_agent = request.user_agent;
 
     const is_head = std.mem.eql(u8, request.method, "HEAD");
     if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
         try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD");
         if (!is_head) try out.writeAll("Method not allowed\n");
         try writer.interface.flush();
+        access_record.status = 405;
+        access_record.bytes = 19;
         return;
     }
 
     const relative_path = normalizeTarget(allocator, request.target) catch {
-        try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
+        const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
+        access_record.status = result.status;
+        access_record.bytes = result.bytes;
         return;
     };
     defer allocator.free(relative_path);
 
-    try servePath(allocator, io, root, out, &writer, relative_path, is_head);
+    const result = try servePath(allocator, io, root, out, &writer, relative_path, is_head);
+    access_record.status = result.status;
+    access_record.bytes = result.bytes;
+}
+
+fn finishAccessLog(logger: *Logger, io: Io, start: Io.Timestamp, record: *AccessRecord) void {
+    const end = Io.Timestamp.now(io, .awake);
+    record.duration_us = start.durationTo(end).toMicroseconds();
+    logger.access(record.*);
 }
 
 fn readHttpRequest(allocator: Allocator, reader: *Io.net.Stream.Reader) ![]u8 {
@@ -337,7 +608,24 @@ fn parseRequest(bytes: []const u8) !Request {
     if (!std.mem.startsWith(u8, version_text, "HTTP/1.")) return error.BadRequest;
     if (target.len == 0 or target[0] != '/') return error.BadRequest;
 
-    return .{ .method = method, .target = target };
+    var user_agent: ?[]const u8 = null;
+    var header_start = line_end + 2;
+    while (header_start < bytes.len) {
+        const header_end_rel = std.mem.indexOf(u8, bytes[header_start..], "\r\n") orelse break;
+        const header_end = header_start + header_end_rel;
+        if (header_end == header_start) break;
+        const header = bytes[header_start..header_end];
+        if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
+            const name = std.mem.trim(u8, header[0..colon], &std.ascii.whitespace);
+            const value = std.mem.trim(u8, header[colon + 1 ..], &std.ascii.whitespace);
+            if (std.ascii.eqlIgnoreCase(name, "User-Agent")) {
+                user_agent = value;
+            }
+        }
+        header_start = header_end + 2;
+    }
+
+    return .{ .method = method, .target = target, .user_agent = user_agent };
 }
 
 fn normalizeTarget(allocator: Allocator, target: []const u8) ![]u8 {
@@ -404,15 +692,14 @@ fn servePath(
     stream_writer: *Io.net.Stream.Writer,
     relative_path: []const u8,
     is_head: bool,
-) !void {
+) !ResponseResult {
     var file = root.openFile(io, relative_path, .{
         .mode = .read_only,
         .allow_directory = false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
-            try sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
-            return;
+            return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
         },
         error.IsDir => {
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
@@ -420,8 +707,7 @@ fn servePath(
             return servePath(allocator, io, root, out, stream_writer, index_path, is_head);
         },
         error.AccessDenied => {
-            try sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
-            return;
+            return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
         },
         else => return err,
     };
@@ -429,8 +715,7 @@ fn servePath(
 
     const stat = try file.stat(io);
     if (stat.kind != .file) {
-        try sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
-        return;
+        return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
     }
 
     const content_type = mimeType(relative_path);
@@ -439,6 +724,7 @@ fn servePath(
         try streamFile(io, out, file);
     }
     try stream_writer.interface.flush();
+    return .{ .status = 200, .bytes = if (is_head) 0 else stat.size };
 }
 
 fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
@@ -454,10 +740,11 @@ fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
     }
 }
 
-fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: ResponseStatus, body: []const u8) !void {
+fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: ResponseStatus, body: []const u8) !ResponseResult {
     try sendHeaders(out, status, "text/plain; charset=utf-8", body.len, "close", null);
     try out.writeAll(body);
     try stream_writer.interface.flush();
+    return .{ .status = status.code, .bytes = body.len };
 }
 
 fn sendHeaders(
@@ -621,13 +908,30 @@ test "parse cli commands" {
 }
 
 test "parse cli serve options" {
-    const args: []const [:0]const u8 = &.{ "qaws", "--host", "127.0.0.1", "--port", "8080", "--serve", "site", "-d" };
+    const args: []const [:0]const u8 = &.{
+        "qaws",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8080",
+        "--serve",
+        "site",
+        "--log-format",
+        "jsonl",
+        "--log-file",
+        "qaws.log",
+        "--no-access-log",
+        "-d",
+    };
     const command = try parseArgs(args);
     switch (command) {
         .serve => |config| {
             try std.testing.expectEqualStrings("127.0.0.1", config.host);
             try std.testing.expectEqual(@as(u16, 8080), config.port);
             try std.testing.expectEqualStrings("site", config.serve_dir);
+            try std.testing.expectEqual(LogFormat.jsonl, config.log_format);
+            try std.testing.expectEqualStrings("qaws.log", config.log_file.?);
+            try std.testing.expect(!config.access_log);
             try std.testing.expect(config.daemon);
         },
         else => return error.TestExpectedEqual,
@@ -647,4 +951,13 @@ test "parse cli skips duplicated argv0" {
 test "parse cli skips argv0 basename duplicate" {
     const args: []const [:0]const u8 = &.{ "qaws", "/data/data/com.termux/files/usr/bin/qaws", "version" };
     try std.testing.expectEqual(ParsedCommand.version, try parseArgs(args));
+}
+
+test "json log string escaping" {
+    const allocator = std.testing.allocator;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    try appendJsonString(&output, allocator, "a\"b\\c\n");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", output.items);
 }
