@@ -1,0 +1,15 @@
+.{
+    .name = .qaws,
+    .version = "0.1.0",
+    .fingerprint = 0x12a076458481ac0b,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        ".gitignore",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "public",
+        "scripts",
+        "README.md",
+    },
+}
