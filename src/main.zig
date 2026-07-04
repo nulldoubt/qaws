@@ -9,6 +9,8 @@ const version = "0.2.0";
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
 const LogFormat = enum {
     plain,
     jsonl,
@@ -37,6 +39,9 @@ const Config = struct {
 const ParsedCommand = union(enum) {
     serve: Config,
     check: Config,
+    status: Config,
+    stop: StopCommand,
+    restart: StopCommand,
     help,
     version,
 };
@@ -44,8 +49,21 @@ const ParsedCommand = union(enum) {
 const CliCommand = enum {
     serve,
     check,
+    status,
+    stop,
+    restart,
     help,
     version,
+};
+
+const StopCommand = struct {
+    config: Config,
+    force: bool = false,
+};
+
+const StopSignal = enum {
+    term,
+    kill,
 };
 
 const CliOptions = struct {
@@ -59,6 +77,7 @@ const CliOptions = struct {
     log_file: ?[]const u8 = null,
     access_log: ?bool = null,
     pid_file: ?[]const u8 = null,
+    force: bool = false,
 };
 
 const FileConfig = struct {
@@ -301,26 +320,92 @@ pub fn main(init: std.process.Init) !void {
         .help => try printHelp(),
         .version => try printVersion(),
         .check => |config| try checkConfig(io, config),
-        .serve => |raw_config| {
-            var config = raw_config;
-            var owned_serve_dir: ?[:0]u8 = null;
-            defer if (owned_serve_dir) |path| allocator.free(path);
-
-            if (config.daemon) {
-                owned_serve_dir = try Io.Dir.cwd().realPathFileAlloc(
-                    std.Io.Threaded.global_single_threaded.io(),
-                    config.serve_dir,
-                    allocator,
-                );
-                config.serve_dir = owned_serve_dir.?;
-                try daemonize();
-            }
-
-            var logger = try Logger.init(allocator, io, config);
-            defer logger.deinit();
-            try serve(allocator, config, &logger);
+        .status => |config| daemonStatus(config_arena.allocator(), io, init.environ_map.*, config) catch |err| {
+            if (err != error.NotRunning) try printRuntimeError(err);
+            std.process.exit(1);
+        },
+        .stop => |command_config| daemonStop(config_arena.allocator(), io, init.environ_map.*, command_config.config, command_config.force) catch |err| {
+            try printRuntimeError(err);
+            std.process.exit(1);
+        },
+        .restart => |command_config| {
+            daemonStop(config_arena.allocator(), io, init.environ_map.*, command_config.config, command_config.force) catch |err| switch (err) {
+                error.NotRunning => {},
+                else => {
+                    try printRuntimeError(err);
+                    std.process.exit(1);
+                },
+            };
+            var config = command_config.config;
+            config.daemon = true;
+            runServeCommand(allocator, config_arena.allocator(), io, init.environ_map.*, config) catch |err| {
+                try printRuntimeError(err);
+                std.process.exit(2);
+            };
+        },
+        .serve => |config| {
+            runServeCommand(allocator, config_arena.allocator(), io, init.environ_map.*, config) catch |err| {
+                try printRuntimeError(err);
+                std.process.exit(2);
+            };
         },
     }
+}
+
+const PidFile = struct {
+    path: []const u8,
+    file: Io.File,
+    io: Io,
+
+    fn writeCurrentPid(self: *PidFile) !void {
+        var buffer: [64]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buffer);
+        try writer.print("{d}\n", .{currentPid()});
+        const bytes = writer.buffered();
+        try self.file.setLength(self.io, 0);
+        try self.file.writePositionalAll(self.io, bytes, 0);
+    }
+
+    fn deinit(self: *PidFile) void {
+        self.file.unlock(self.io);
+        self.file.close(self.io);
+        deletePath(self.io, self.path) catch {};
+    }
+};
+
+fn runServeCommand(
+    allocator: Allocator,
+    config_allocator: Allocator,
+    io: Io,
+    env_map: std.process.Environ.Map,
+    raw_config: Config,
+) !void {
+    var config = raw_config;
+    var owned_serve_dir: ?[:0]u8 = null;
+    defer if (owned_serve_dir) |path| allocator.free(path);
+
+    var pid_file: ?PidFile = null;
+    defer if (pid_file) |*pid| pid.deinit();
+
+    if (config.daemon) {
+        try ensureDaemonSupported();
+        owned_serve_dir = try Io.Dir.cwd().realPathFileAlloc(io, config.serve_dir, allocator);
+        config.serve_dir = owned_serve_dir.?;
+        config.pid_file = try resolvePidPath(config_allocator, io, env_map, config);
+        if (config.log_file == null) {
+            config.log_file = try defaultRuntimeFilePath(config_allocator, io, env_map, config, "log");
+        } else if (config.log_file) |path| {
+            config.log_file = try absolutePath(config_allocator, io, path);
+        }
+        pid_file = try acquirePidFile(config_allocator, io, config.pid_file.?);
+        try daemonize();
+        try pid_file.?.writeCurrentPid();
+    }
+
+    installShutdownHandlers();
+    var logger = try Logger.init(allocator, io, config);
+    defer logger.deinit();
+    try serve(allocator, config, &logger);
 }
 
 fn loadArgs(allocator: Allocator, io: Io, init_args: std.process.Args) !LoadedArgs {
@@ -396,6 +481,9 @@ fn parseArgs(args: []const []const u8) CliError!ParsedCommand {
     return switch (cli.command) {
         .serve => .{ .serve = config },
         .check => .{ .check = config },
+        .status => .{ .status = config },
+        .stop => .{ .stop = .{ .config = config, .force = cli.force } },
+        .restart => .{ .restart = .{ .config = config, .force = cli.force } },
         .help => .help,
         .version => .version,
     };
@@ -453,6 +541,14 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
             cli.daemon = true;
         } else if (std.mem.eql(u8, arg, "check")) {
             cli.command = .check;
+        } else if (std.mem.eql(u8, arg, "status")) {
+            cli.command = .status;
+        } else if (std.mem.eql(u8, arg, "stop")) {
+            cli.command = .stop;
+        } else if (std.mem.eql(u8, arg, "restart")) {
+            cli.command = .restart;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            cli.force = true;
         } else if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             cli.command = .help;
         } else if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version")) {
@@ -475,6 +571,9 @@ fn resolveCommand(allocator: Allocator, io: Io, cli: CliOptions) !ParsedCommand 
     return switch (cli.command) {
         .serve => .{ .serve = config },
         .check => .{ .check = config },
+        .status => .{ .status = config },
+        .stop => .{ .stop = .{ .config = config, .force = cli.force } },
+        .restart => .{ .restart = .{ .config = config, .force = cli.force } },
         .help => .help,
         .version => .version,
     };
@@ -588,6 +687,233 @@ fn readFileAlloc(allocator: Allocator, io: Io, path: []const u8, max_bytes: usiz
     return try output.toOwnedSlice(allocator);
 }
 
+fn ensureDaemonSupported() !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.UnsupportedOperatingSystem;
+    }
+}
+
+fn resolvePidPath(allocator: Allocator, io: Io, env_map: std.process.Environ.Map, config: Config) ![]const u8 {
+    if (config.pid_file) |path| return absolutePath(allocator, io, path);
+    return defaultRuntimeFilePath(allocator, io, env_map, config, "pid");
+}
+
+fn defaultRuntimeFilePath(
+    allocator: Allocator,
+    io: Io,
+    env_map: std.process.Environ.Map,
+    config: Config,
+    extension: []const u8,
+) ![]const u8 {
+    const runtime_dir = try defaultRuntimeDir(allocator, env_map);
+    try ensureDirPath(io, runtime_dir);
+
+    const safe_host = try sanitizePathComponent(allocator, config.host);
+    return std.fmt.allocPrint(allocator, "{s}/qaws-{s}-{d}.{s}", .{ runtime_dir, safe_host, config.port, extension });
+}
+
+fn defaultRuntimeDir(allocator: Allocator, env_map: std.process.Environ.Map) ![]const u8 {
+    if (env_map.get("XDG_RUNTIME_DIR")) |path| {
+        if (path.len != 0) return std.fmt.allocPrint(allocator, "{s}/qaws", .{path});
+    }
+    if (env_map.get("PREFIX")) |path| {
+        if (path.len != 0) return std.fmt.allocPrint(allocator, "{s}/var/run/qaws", .{path});
+    }
+    return std.fmt.allocPrint(allocator, "/tmp/qaws-{d}", .{currentUid()});
+}
+
+fn sanitizePathComponent(allocator: Allocator, value: []const u8) ![]const u8 {
+    var output = try std.ArrayList(u8).initCapacity(allocator, value.len);
+    errdefer output.deinit(allocator);
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_') {
+            try output.append(allocator, byte);
+        } else {
+            try output.append(allocator, '_');
+        }
+    }
+    return try output.toOwnedSlice(allocator);
+}
+
+fn absolutePath(allocator: Allocator, io: Io, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(io, &cwd_buffer);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd_buffer[0..cwd_len], path });
+}
+
+fn ensureParentDir(io: Io, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try ensureDirPath(io, parent);
+    }
+}
+
+fn ensureDirPath(io: Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        var dir = Io.Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (std.mem.eql(u8, path, "/")) return;
+                var root = try Io.Dir.openDirAbsolute(io, "/", .{});
+                defer root.close(io);
+                _ = try root.createDirPathStatus(io, path[1..], .default_dir);
+                return;
+            },
+            else => return err,
+        };
+        dir.close(io);
+    } else {
+        _ = try Io.Dir.cwd().createDirPathStatus(io, path, .default_dir);
+    }
+}
+
+fn acquirePidFile(allocator: Allocator, io: Io, path: []const u8) !PidFile {
+    _ = allocator;
+    try ensureParentDir(io, path);
+    var file = Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => return error.DaemonAlreadyRunning,
+        else => return err,
+    };
+    errdefer file.close(io);
+    return .{ .path = path, .file = file, .io = io };
+}
+
+fn readPidFile(allocator: Allocator, io: Io, path: []const u8) !i64 {
+    const bytes = try readFileAlloc(allocator, io, path, 128);
+    defer allocator.free(bytes);
+    const trimmed = std.mem.trim(u8, bytes, &std.ascii.whitespace);
+    if (trimmed.len == 0) return error.InvalidPidFile;
+    return std.fmt.parseInt(i64, trimmed, 10) catch error.InvalidPidFile;
+}
+
+fn daemonStatus(allocator: Allocator, io: Io, env_map: std.process.Environ.Map, config: Config) !void {
+    try ensureDaemonSupported();
+    const pid_path = try resolvePidPath(allocator, io, env_map, config);
+    const stdout = std.Io.File.stdout();
+    var buffer: [512]u8 = undefined;
+    var writer = stdout.writer(io, &buffer);
+
+    const pid = readPidFile(allocator, io, pid_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            try writer.interface.print("qaws: not running ({s})\n", .{pid_path});
+            try writer.flush();
+            return error.NotRunning;
+        },
+        else => return err,
+    };
+    if (processAlive(pid)) {
+        try writer.interface.print("qaws: running pid={d} ({s})\n", .{ pid, pid_path });
+    } else {
+        try writer.interface.print("qaws: stale pid file pid={d} ({s})\n", .{ pid, pid_path });
+        try writer.flush();
+        return error.NotRunning;
+    }
+    try writer.flush();
+}
+
+fn daemonStop(allocator: Allocator, io: Io, env_map: std.process.Environ.Map, config: Config, force: bool) !void {
+    try ensureDaemonSupported();
+    const pid_path = try resolvePidPath(allocator, io, env_map, config);
+    const pid = readPidFile(allocator, io, pid_path) catch |err| switch (err) {
+        error.FileNotFound => return error.NotRunning,
+        else => return err,
+    };
+    if (!processAlive(pid)) {
+        deletePath(io, pid_path) catch {};
+        return error.NotRunning;
+    }
+
+    try sendSignal(pid, .term);
+    if (waitForExit(io, pid, 30)) {
+        deletePath(io, pid_path) catch {};
+        return;
+    }
+    if (force) {
+        try sendSignal(pid, .kill);
+        if (waitForExit(io, pid, 30)) {
+            deletePath(io, pid_path) catch {};
+            return;
+        }
+    }
+    return error.ProcessStillRunning;
+}
+
+fn waitForExit(io: Io, pid: i64, attempts: usize) bool {
+    var i: usize = 0;
+    while (i < attempts) : (i += 1) {
+        if (!processAlive(pid)) return true;
+        Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch {};
+    }
+    return !processAlive(pid);
+}
+
+fn deletePath(io: Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        return Io.Dir.deleteFileAbsolute(io, path);
+    }
+    return Io.Dir.cwd().deleteFile(io, path);
+}
+
+fn currentPid() i64 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        .windows, .wasi => 0,
+        else => @intCast(std.c.getpid()),
+    };
+}
+
+fn currentUid() u32 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getuid()),
+        .windows, .wasi => 0,
+        else => @intCast(std.c.getuid()),
+    };
+}
+
+fn processAlive(pid: i64) bool {
+    if (pid <= 0) return false;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+    const zero_signal: std.posix.SIG = @enumFromInt(0);
+    std.posix.kill(@intCast(pid), zero_signal) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => return false,
+    };
+    return true;
+}
+
+fn sendSignal(pid: i64, signal: StopSignal) !void {
+    if (pid <= 0) return error.InvalidPidFile;
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.UnsupportedOperatingSystem;
+    const posix_signal: std.posix.SIG = switch (signal) {
+        .term => .TERM,
+        .kill => .KILL,
+    };
+    return std.posix.kill(@intCast(pid), posix_signal);
+}
+
+fn installShutdownHandlers() void {
+    shutdown_requested.store(false, .seq_cst);
+    if (builtin.os.tag != .linux) return;
+
+    const action = std.os.linux.Sigaction{
+        .handler = .{ .handler = linuxShutdownSignalHandler },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(.TERM, &action, null);
+    _ = std.os.linux.sigaction(.INT, &action, null);
+}
+
+fn linuxShutdownSignalHandler(signal: std.os.linux.SIG) callconv(.c) void {
+    _ = signal;
+    shutdown_requested.store(true, .seq_cst);
+}
+
 fn normalizeArg(arg: []const u8) []const u8 {
     return std.mem.trim(u8, arg, &std.ascii.whitespace);
 }
@@ -681,6 +1007,22 @@ fn printConfigError(err: anyerror) !void {
     try writer.flush();
 }
 
+fn printRuntimeError(err: anyerror) !void {
+    const stderr = std.Io.File.stderr();
+    var buffer: [512]u8 = undefined;
+    var writer = stderr.writer(std.Io.Threaded.global_single_threaded.io(), &buffer);
+    const out = &writer.interface;
+
+    switch (err) {
+        error.DaemonAlreadyRunning => try out.writeAll("qaws: daemon already running; use `qaws status`, `qaws stop`, or `qaws restart`\n"),
+        error.NotRunning => try out.writeAll("qaws: not running\n"),
+        error.ProcessStillRunning => try out.writeAll("qaws: process is still running; retry with `qaws stop --force`\n"),
+        error.UnsupportedOperatingSystem => try out.writeAll("qaws: daemon control is not supported on this operating system\n"),
+        else => try out.print("qaws: runtime error: {s}\n", .{@errorName(err)}),
+    }
+    try writer.flush();
+}
+
 fn printHelp() !void {
     const stdout = std.Io.File.stdout();
     var buffer: [1024]u8 = undefined;
@@ -693,6 +1035,9 @@ fn printHelp() !void {
         \\Usage:
         \\  qaws [--host <addr>] [--port <port>] [--serve <directory>] [-d]
         \\  qaws check --config <file>
+        \\  qaws status [--config <file>] [--pid-file <path>]
+        \\  qaws stop [--config <file>] [--pid-file <path>] [--force]
+        \\  qaws restart [--config <file>] [--pid-file <path>] [--force]
         \\  qaws help
         \\  qaws version
         \\
@@ -749,15 +1094,20 @@ fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
 
     try logger.event("info", "serving {s} on {s}:{d}", .{ config.serve_dir, config.host, config.port });
 
-    while (true) {
+    accept_loop: while (!shutdown_requested.load(.seq_cst)) {
         const stream = server.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
-            else => return err,
+            else => {
+                if (shutdown_requested.load(.seq_cst)) break :accept_loop;
+                return err;
+            },
         };
         handleConnection(allocator, io, root, stream, config, logger) catch |err| {
             logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
         };
     }
+
+    logger.event("info", "shutdown", .{}) catch {};
 }
 
 fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger) !void {
@@ -1354,6 +1704,12 @@ test "parse cli commands" {
     const cli = try parseCli(check_args);
     try std.testing.expectEqual(CliCommand.check, cli.command);
     try std.testing.expectEqualStrings("qaws.json", cli.config_path.?);
+
+    const stop_args: []const [:0]const u8 = &.{ "qaws", "stop", "--pid-file", "/tmp/qaws.pid", "--force" };
+    const stop_cli = try parseCli(stop_args);
+    try std.testing.expectEqual(CliCommand.stop, stop_cli.command);
+    try std.testing.expectEqualStrings("/tmp/qaws.pid", stop_cli.pid_file.?);
+    try std.testing.expect(stop_cli.force);
 }
 
 test "parse cli serve options" {
@@ -1494,4 +1850,11 @@ test "http date parsing and slash redirect locations" {
     try std.testing.expectEqualStrings("/docs/?x=1", redirected);
     try std.testing.expect(!targetPathHasTrailingSlash("/docs?x=1"));
     try std.testing.expect(targetPathHasTrailingSlash("/docs/?x=1"));
+}
+
+test "runtime path component sanitization" {
+    const allocator = std.testing.allocator;
+    const sanitized = try sanitizePathComponent(allocator, "127.0.0.1:8080/[::1]");
+    defer allocator.free(sanitized);
+    try std.testing.expectEqualStrings("127.0.0.1_8080____1_", sanitized);
 }
