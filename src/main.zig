@@ -14,6 +14,11 @@ const LogFormat = enum {
     jsonl,
 };
 
+const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 const Config = struct {
     host: []const u8 = "0.0.0.0",
     port: u16 = 80,
@@ -26,6 +31,7 @@ const Config = struct {
     dotfiles: DotfilePolicy = .deny_except_well_known,
     last_modified: bool = true,
     trailing_slash_redirect: bool = true,
+    headers: []const Header = &.{},
 };
 
 const ParsedCommand = union(enum) {
@@ -100,6 +106,7 @@ const Request = struct {
     method: []const u8,
     target: []const u8,
     user_agent: ?[]const u8 = null,
+    if_modified_since: ?[]const u8 = null,
 };
 
 const ResponseStatus = struct {
@@ -530,11 +537,36 @@ fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Confi
 
     if (file_config.headers) |headers| {
         if (headers != .object) return error.InvalidHeaderConfig;
+        var header_list: std.ArrayList(Header) = .empty;
+        errdefer header_list.deinit(allocator);
+
         var it = headers.object.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .string) return error.InvalidHeaderConfig;
+            const name = entry.key_ptr.*;
+            if (isProtectedHeader(name)) return error.ProtectedHeader;
+            try header_list.append(allocator, .{
+                .name = try allocator.dupe(u8, name),
+                .value = try allocator.dupe(u8, entry.value_ptr.string),
+            });
         }
+        config.headers = try header_list.toOwnedSlice(allocator);
     }
+}
+
+fn isProtectedHeader(name: []const u8) bool {
+    const protected = [_][]const u8{
+        "Content-Length",
+        "Content-Type",
+        "Connection",
+        "Server",
+        "Allow",
+        "Location",
+    };
+    for (protected) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+    return false;
 }
 
 fn readFileAlloc(allocator: Allocator, io: Io, path: []const u8, max_bytes: usize) ![]u8 {
@@ -722,13 +754,13 @@ fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
             error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(allocator, io, root, stream, logger) catch |err| {
+        handleConnection(allocator, io, root, stream, config, logger) catch |err| {
             logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
         };
     }
 }
 
-fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, logger: *Logger) !void {
+fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger) !void {
     defer stream.close(io);
 
     const start = Io.Timestamp.now(io, .awake);
@@ -775,7 +807,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
 
     const is_head = std.mem.eql(u8, request.method, "HEAD");
     if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
-        try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD");
+        try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
         if (!is_head) try out.writeAll("Method not allowed\n");
         try writer.interface.flush();
         access_record.status = 405;
@@ -783,7 +815,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
         return;
     }
 
-    const relative_path = normalizeTarget(allocator, request.target) catch {
+    const relative_path = normalizeTarget(allocator, request.target, config.dotfiles) catch {
         const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
         access_record.status = result.status;
         access_record.bytes = result.bytes;
@@ -791,7 +823,18 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
     };
     defer allocator.free(relative_path);
 
-    const result = try servePath(allocator, io, root, out, &writer, relative_path, is_head);
+    const result = try servePath(
+        allocator,
+        io,
+        root,
+        out,
+        &writer,
+        relative_path,
+        request.target,
+        request.if_modified_since,
+        is_head,
+        config,
+    );
     access_record.status = result.status;
     access_record.bytes = result.bytes;
 }
@@ -833,6 +876,7 @@ fn parseRequest(bytes: []const u8) !Request {
     if (target.len == 0 or target[0] != '/') return error.BadRequest;
 
     var user_agent: ?[]const u8 = null;
+    var if_modified_since: ?[]const u8 = null;
     var header_start = line_end + 2;
     while (header_start < bytes.len) {
         const header_end_rel = std.mem.indexOf(u8, bytes[header_start..], "\r\n") orelse break;
@@ -844,15 +888,22 @@ fn parseRequest(bytes: []const u8) !Request {
             const value = std.mem.trim(u8, header[colon + 1 ..], &std.ascii.whitespace);
             if (std.ascii.eqlIgnoreCase(name, "User-Agent")) {
                 user_agent = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "If-Modified-Since")) {
+                if_modified_since = value;
             }
         }
         header_start = header_end + 2;
     }
 
-    return .{ .method = method, .target = target, .user_agent = user_agent };
+    return .{
+        .method = method,
+        .target = target,
+        .user_agent = user_agent,
+        .if_modified_since = if_modified_since,
+    };
 }
 
-fn normalizeTarget(allocator: Allocator, target: []const u8) ![]u8 {
+fn normalizeTarget(allocator: Allocator, target: []const u8, dotfiles: DotfilePolicy) ![]u8 {
     const path_part = blk: {
         const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
         const f = std.mem.indexOfScalar(u8, target[0..q], '#') orelse q;
@@ -874,6 +925,7 @@ fn normalizeTarget(allocator: Allocator, target: []const u8) ![]u8 {
 
         if (decoded.items.len == 0 or std.mem.eql(u8, decoded.items, ".")) continue;
         if (std.mem.eql(u8, decoded.items, "..")) return error.Forbidden;
+        if (isDotfileSegment(decoded.items, dotfiles)) return error.Forbidden;
 
         if (output.items.len != 0) try output.append(allocator, '/');
         try output.appendSlice(allocator, decoded.items);
@@ -889,6 +941,97 @@ fn normalizeTarget(allocator: Allocator, target: []const u8) ![]u8 {
     }
 
     return try output.toOwnedSlice(allocator);
+}
+
+fn isDotfileSegment(segment: []const u8, dotfiles: DotfilePolicy) bool {
+    if (segment.len == 0 or segment[0] != '.') return false;
+    return switch (dotfiles) {
+        .allow => false,
+        .deny_all => true,
+        .deny_except_well_known => !std.mem.eql(u8, segment, ".well-known"),
+    };
+}
+
+fn targetPathHasTrailingSlash(target: []const u8) bool {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    if (q == 0) return false;
+    return target[q - 1] == '/';
+}
+
+fn slashRedirectLocation(allocator: Allocator, target: []const u8) ![]u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    if (q > 0 and target[q - 1] == '/') return allocator.dupe(u8, target);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ target[0..q], target[q..] });
+}
+
+fn formatHttpDate(timestamp: Io.Timestamp, buffer: []u8) []const u8 {
+    const seconds_i = timestamp.toSeconds();
+    const seconds: u64 = if (seconds_i < 0) 0 else @intCast(seconds_i);
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    const weekday_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const weekday_index: usize = @intCast((epoch_day.day + 4) % 7);
+
+    var writer: Io.Writer = .fixed(buffer);
+    writer.print(
+        "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+        .{
+            weekday_names[weekday_index],
+            month_day.day_index + 1,
+            month_names[@intFromEnum(month_day.month) - 1],
+            year_day.year,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    ) catch return "";
+    return writer.buffered();
+}
+
+fn parseHttpDate(value: []const u8) ?i64 {
+    if (value.len != 29) return null;
+    if (value[3] != ',' or value[4] != ' ' or value[7] != ' ' or value[11] != ' ' or
+        value[16] != ' ' or value[19] != ':' or value[22] != ':' or value[25] != ' ')
+    {
+        return null;
+    }
+    if (!std.mem.eql(u8, value[26..29], "GMT")) return null;
+
+    const day = std.fmt.parseInt(u8, value[5..7], 10) catch return null;
+    const month = parseHttpMonth(value[8..11]) orelse return null;
+    const year = std.fmt.parseInt(u16, value[12..16], 10) catch return null;
+    const hour = std.fmt.parseInt(u8, value[17..19], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, value[20..22], 10) catch return null;
+    const second = std.fmt.parseInt(u8, value[23..25], 10) catch return null;
+
+    if (year < 1970 or day == 0 or day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+
+    var days: u64 = 0;
+    var y: u16 = 1970;
+    while (y < year) : (y += 1) {
+        days += std.time.epoch.getDaysInYear(y);
+    }
+    var m: u8 = 1;
+    while (m < month) : (m += 1) {
+        days += std.time.epoch.getDaysInMonth(year, @enumFromInt(m));
+    }
+    days += day - 1;
+
+    const total: u64 = days * std.time.s_per_day + @as(u64, hour) * std.time.s_per_hour + @as(u64, minute) * std.time.s_per_min + second;
+    return @intCast(total);
+}
+
+fn parseHttpMonth(value: []const u8) ?u8 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 1..) |name, month| {
+        if (std.mem.eql(u8, value, name)) return @intCast(month);
+    }
+    return null;
 }
 
 fn appendPercentDecoded(output: *std.ArrayList(u8), allocator: Allocator, input: []const u8) !void {
@@ -915,7 +1058,10 @@ fn servePath(
     out: *Io.Writer,
     stream_writer: *Io.net.Stream.Writer,
     relative_path: []const u8,
+    request_target: []const u8,
+    if_modified_since: ?[]const u8,
     is_head: bool,
+    config: Config,
 ) !ResponseResult {
     var file = root.openFile(io, relative_path, .{
         .mode = .read_only,
@@ -926,9 +1072,12 @@ fn servePath(
             return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
         },
         error.IsDir => {
+            if (config.trailing_slash_redirect and !targetPathHasTrailingSlash(request_target)) {
+                return sendRedirect(allocator, out, stream_writer, request_target, is_head, config.headers);
+            }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, out, stream_writer, index_path, is_head);
+            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, config);
         },
         error.AccessDenied => {
             return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
@@ -943,7 +1092,31 @@ fn servePath(
     }
 
     const content_type = mimeType(relative_path);
-    try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, "close", null);
+    var last_modified_buffer: [64]u8 = undefined;
+    const last_modified = if (config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
+    if (config.last_modified) {
+        if (if_modified_since) |value| {
+            if (parseHttpDate(value)) |since| {
+                if (since >= stat.mtime.toSeconds()) {
+                    try sendHeaders(
+                        out,
+                        .{ .code = 304, .reason = "Not Modified" },
+                        content_type,
+                        0,
+                        "close",
+                        null,
+                        config.headers,
+                        last_modified,
+                        null,
+                    );
+                    try stream_writer.interface.flush();
+                    return .{ .status = 304, .bytes = 0 };
+                }
+            }
+        }
+    }
+
+    try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, "close", null, config.headers, last_modified, null);
     if (!is_head) {
         try streamFile(io, out, file);
     }
@@ -965,10 +1138,38 @@ fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
 }
 
 fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: ResponseStatus, body: []const u8) !ResponseResult {
-    try sendHeaders(out, status, "text/plain; charset=utf-8", body.len, "close", null);
+    try sendHeaders(out, status, "text/plain; charset=utf-8", body.len, "close", null, &.{}, null, null);
     try out.writeAll(body);
     try stream_writer.interface.flush();
     return .{ .status = status.code, .bytes = body.len };
+}
+
+fn sendRedirect(
+    allocator: Allocator,
+    out: *Io.Writer,
+    stream_writer: *Io.net.Stream.Writer,
+    request_target: []const u8,
+    is_head: bool,
+    extra_headers: []const Header,
+) !ResponseResult {
+    const location = try slashRedirectLocation(allocator, request_target);
+    defer allocator.free(location);
+
+    const body = "Redirecting\n";
+    try sendHeaders(
+        out,
+        .{ .code = 308, .reason = "Permanent Redirect" },
+        "text/plain; charset=utf-8",
+        body.len,
+        "close",
+        null,
+        extra_headers,
+        null,
+        location,
+    );
+    if (!is_head) try out.writeAll(body);
+    try stream_writer.interface.flush();
+    return .{ .status = 308, .bytes = if (is_head) 0 else body.len };
 }
 
 fn sendHeaders(
@@ -978,13 +1179,22 @@ fn sendHeaders(
     content_length: u64,
     connection: []const u8,
     allow: ?[]const u8,
+    extra_headers: []const Header,
+    last_modified: ?[]const u8,
+    location: ?[]const u8,
 ) !void {
     try out.print("HTTP/1.1 {d} {s}\r\n", .{ status.code, status.reason });
     try out.print("Server: {s}\r\n", .{server_name});
     try out.print("Content-Type: {s}\r\n", .{content_type});
     try out.print("Content-Length: {d}\r\n", .{content_length});
     try out.print("Connection: {s}\r\n", .{connection});
+    try out.writeAll("X-Content-Type-Options: nosniff\r\n");
     if (allow) |value| try out.print("Allow: {s}\r\n", .{value});
+    if (last_modified) |value| try out.print("Last-Modified: {s}\r\n", .{value});
+    if (location) |value| try out.print("Location: {s}\r\n", .{value});
+    for (extra_headers) |header| {
+        try out.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
     try out.writeAll("\r\n");
 }
 
@@ -1104,20 +1314,30 @@ fn redirectStandardFiles() !void {
 
 test "normalize root and directory paths" {
     const allocator = std.testing.allocator;
-    const root = try normalizeTarget(allocator, "/");
+    const root = try normalizeTarget(allocator, "/", .deny_except_well_known);
     defer allocator.free(root);
     try std.testing.expectEqualStrings("index.html", root);
 
-    const nested = try normalizeTarget(allocator, "/docs/");
+    const nested = try normalizeTarget(allocator, "/docs/", .deny_except_well_known);
     defer allocator.free(nested);
     try std.testing.expectEqualStrings("docs/index.html", nested);
 }
 
 test "normalize rejects traversal" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/../build.zig"));
-    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/%2e%2e/build.zig"));
-    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/a%2fb"));
+    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/../build.zig", .deny_except_well_known));
+    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/%2e%2e/build.zig", .deny_except_well_known));
+    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/a%2fb", .deny_except_well_known));
+}
+
+test "normalize enforces dotfile policy" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/.env", .deny_except_well_known));
+    try std.testing.expectError(error.Forbidden, normalizeTarget(allocator, "/.well-known/security.txt", .deny_all));
+
+    const well_known = try normalizeTarget(allocator, "/.well-known/security.txt", .deny_except_well_known);
+    defer allocator.free(well_known);
+    try std.testing.expectEqualStrings(".well-known/security.txt", well_known);
 }
 
 test "parse cli commands" {
@@ -1256,4 +1476,22 @@ test "json config rejects unknown keys and invalid headers" {
 
     var config = Config{};
     try std.testing.expectError(error.InvalidHeaderConfig, applyFileConfig(allocator, parsed.value, &config));
+
+    var protected = try std.json.parseFromSlice(FileConfig, allocator, "{ \"headers\": { \"Content-Length\": \"12\" } }", .{
+        .ignore_unknown_fields = false,
+    });
+    defer protected.deinit();
+    try std.testing.expectError(error.ProtectedHeader, applyFileConfig(allocator, protected.value, &config));
+}
+
+test "http date parsing and slash redirect locations" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(?i64, 0), parseHttpDate("Thu, 01 Jan 1970 00:00:00 GMT"));
+    try std.testing.expect(parseHttpDate("bad") == null);
+
+    const redirected = try slashRedirectLocation(allocator, "/docs?x=1");
+    defer allocator.free(redirected);
+    try std.testing.expectEqualStrings("/docs/?x=1", redirected);
+    try std.testing.expect(!targetPathHasTrailingSlash("/docs?x=1"));
+    try std.testing.expect(targetPathHasTrailingSlash("/docs/?x=1"));
 }
