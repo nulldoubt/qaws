@@ -199,8 +199,242 @@ const ConnectionContext = struct {
     stream: Io.net.Stream,
     config: Config,
     logger: *Logger,
+    cache: *StaticCache,
     active_connections: *std.atomic.Value(u32),
 };
+
+const CachedFile = struct {
+    path: []u8,
+    valid: bool,
+    body: []u8,
+    size: u64,
+    mtime_sec: i64,
+    content_type: []const u8,
+    last_modified: ?[]u8,
+    header_200_keep_alive: []u8,
+    header_200_close: []u8,
+    header_304_keep_alive: []u8,
+    header_304_close: []u8,
+    revalidate_after_ns: i96,
+
+    fn snapshot(self: CachedFile, connection: []const u8) CachedFileSnapshot {
+        return .{
+            .body = self.body,
+            .size = self.size,
+            .mtime_sec = self.mtime_sec,
+            .header_200 = cachedHeaderFor(connection, self.header_200_keep_alive, self.header_200_close),
+            .header_304 = cachedHeaderFor(connection, self.header_304_keep_alive, self.header_304_close),
+        };
+    }
+};
+
+const CachedFileSnapshot = struct {
+    body: []const u8,
+    size: u64,
+    mtime_sec: i64,
+    header_200: []const u8,
+    header_304: []const u8,
+};
+
+const StaticCache = struct {
+    allocator: Allocator,
+    enabled: bool,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    revalidate_ms: u32,
+    last_modified: bool,
+    headers: []const Header,
+    mutex: Io.Mutex = .init,
+    entries: std.ArrayList(CachedFile) = .empty,
+    retired: std.ArrayList([]u8) = .empty,
+    total_body_bytes: usize = 0,
+
+    fn init(allocator: Allocator, config: Config) StaticCache {
+        return .{
+            .allocator = allocator,
+            .enabled = config.cache_enabled,
+            .max_file_bytes = config.cache_max_file_bytes,
+            .max_total_bytes = config.cache_max_total_bytes,
+            .revalidate_ms = config.cache_revalidate_ms,
+            .last_modified = config.last_modified,
+            .headers = config.headers,
+        };
+    }
+
+    fn deinit(self: *StaticCache) void {
+        for (self.entries.items) |entry| {
+            self.allocator.free(entry.path);
+            if (entry.body.len != 0) self.allocator.free(entry.body);
+            if (entry.last_modified) |value| self.allocator.free(value);
+            self.allocator.free(entry.header_200_keep_alive);
+            self.allocator.free(entry.header_200_close);
+            self.allocator.free(entry.header_304_keep_alive);
+            self.allocator.free(entry.header_304_close);
+        }
+        for (self.retired.items) |bytes| {
+            if (bytes.len != 0) self.allocator.free(bytes);
+        }
+        self.entries.deinit(self.allocator);
+        self.retired.deinit(self.allocator);
+    }
+
+    fn tryServe(
+        self: *StaticCache,
+        io: Io,
+        root: Io.Dir,
+        out: *Io.Writer,
+        stream_writer: *Io.net.Stream.Writer,
+        relative_path: []const u8,
+        if_modified_since: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+    ) !?ResponseResult {
+        if (!self.enabled) return null;
+
+        const cached = try self.snapshot(io, root, relative_path, connection) orelse return null;
+        if (self.last_modified) {
+            if (if_modified_since) |value| {
+                if (parseHttpDate(value)) |since| {
+                    if (since >= cached.mtime_sec) {
+                        try out.writeAll(cached.header_304);
+                        try stream_writer.interface.flush();
+                        return .{ .status = 304, .bytes = 0 };
+                    }
+                }
+            }
+        }
+
+        try out.writeAll(cached.header_200);
+        if (!is_head) try out.writeAll(cached.body);
+        try stream_writer.interface.flush();
+        return .{ .status = 200, .bytes = if (is_head) 0 else cached.size };
+    }
+
+    fn snapshot(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
+        const now = Io.Timestamp.now(io, .awake);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        for (self.entries.items) |*entry| {
+            if (!std.mem.eql(u8, entry.path, relative_path)) continue;
+            if (now.nanoseconds >= entry.revalidate_after_ns) {
+                if (try self.loadEntry(io, root, relative_path, now, entry.body.len)) |fresh| {
+                    self.replaceEntry(entry, fresh);
+                } else {
+                    entry.valid = false;
+                    entry.revalidate_after_ns = self.nextRevalidate(now).nanoseconds;
+                }
+            }
+            if (!entry.valid) return null;
+            return entry.snapshot(connection);
+        }
+
+        var entry = try self.loadEntry(io, root, relative_path, now, 0) orelse return null;
+        errdefer self.destroyLoadedEntry(&entry);
+        try self.entries.append(self.allocator, entry);
+        return self.entries.items[self.entries.items.len - 1].snapshot(connection);
+    }
+
+    fn loadEntry(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, now: Io.Timestamp, replacing_body_len: usize) !?CachedFile {
+        var file = root.openFile(io, relative_path, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.IsDir, error.AccessDenied => return null,
+            else => return err,
+        };
+        defer file.close(io);
+
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return null;
+        const body_len = std.math.cast(usize, stat.size) orelse return null;
+        if (body_len > self.max_file_bytes) return null;
+        if (self.total_body_bytes - replacing_body_len + body_len > self.max_total_bytes) return null;
+
+        const body = try self.allocator.alloc(u8, body_len);
+        errdefer self.allocator.free(body);
+        try readFileBody(io, file, body);
+
+        var last_modified_buffer: [64]u8 = undefined;
+        const last_modified: ?[]u8 = if (self.last_modified)
+            try self.allocator.dupe(u8, formatHttpDate(stat.mtime, &last_modified_buffer))
+        else
+            null;
+        errdefer if (last_modified) |value| self.allocator.free(value);
+
+        const content_type = mimeType(relative_path);
+        const header_200_keep_alive = try buildHeaderAlloc(self.allocator, .{ .code = 200, .reason = "OK" }, content_type, stat.size, "keep-alive", null, self.headers, last_modified, null);
+        errdefer self.allocator.free(header_200_keep_alive);
+        const header_200_close = try buildHeaderAlloc(self.allocator, .{ .code = 200, .reason = "OK" }, content_type, stat.size, "close", null, self.headers, last_modified, null);
+        errdefer self.allocator.free(header_200_close);
+        const header_304_keep_alive = try buildHeaderAlloc(self.allocator, .{ .code = 304, .reason = "Not Modified" }, content_type, 0, "keep-alive", null, self.headers, last_modified, null);
+        errdefer self.allocator.free(header_304_keep_alive);
+        const header_304_close = try buildHeaderAlloc(self.allocator, .{ .code = 304, .reason = "Not Modified" }, content_type, 0, "close", null, self.headers, last_modified, null);
+        errdefer self.allocator.free(header_304_close);
+
+        const path = try self.allocator.dupe(u8, relative_path);
+        errdefer self.allocator.free(path);
+
+        self.total_body_bytes += body_len;
+        return .{
+            .path = path,
+            .valid = true,
+            .body = body,
+            .size = stat.size,
+            .mtime_sec = stat.mtime.toSeconds(),
+            .content_type = content_type,
+            .last_modified = last_modified,
+            .header_200_keep_alive = header_200_keep_alive,
+            .header_200_close = header_200_close,
+            .header_304_keep_alive = header_304_keep_alive,
+            .header_304_close = header_304_close,
+            .revalidate_after_ns = self.nextRevalidate(now).nanoseconds,
+        };
+    }
+
+    fn replaceEntry(self: *StaticCache, entry: *CachedFile, fresh: CachedFile) void {
+        self.retire(entry.body);
+        if (entry.last_modified) |value| self.retire(value);
+        self.retire(entry.header_200_keep_alive);
+        self.retire(entry.header_200_close);
+        self.retire(entry.header_304_keep_alive);
+        self.retire(entry.header_304_close);
+        self.total_body_bytes -= @intCast(entry.body.len);
+
+        const old_path = entry.path;
+        entry.* = fresh;
+        self.allocator.free(entry.path);
+        entry.path = old_path;
+    }
+
+    fn destroyLoadedEntry(self: *StaticCache, entry: *CachedFile) void {
+        self.allocator.free(entry.path);
+        if (entry.body.len != 0) {
+            self.total_body_bytes -= @intCast(entry.body.len);
+            self.allocator.free(entry.body);
+        }
+        if (entry.last_modified) |value| self.allocator.free(value);
+        self.allocator.free(entry.header_200_keep_alive);
+        self.allocator.free(entry.header_200_close);
+        self.allocator.free(entry.header_304_keep_alive);
+        self.allocator.free(entry.header_304_close);
+    }
+
+    fn retire(self: *StaticCache, bytes: []u8) void {
+        if (bytes.len == 0) return;
+        self.retired.append(self.allocator, bytes) catch {};
+    }
+
+    fn nextRevalidate(self: StaticCache, now: Io.Timestamp) Io.Timestamp {
+        return now.addDuration(Io.Duration.fromMilliseconds(self.revalidate_ms));
+    }
+};
+
+fn cachedHeaderFor(connection: []const u8, keep_alive: []const u8, close: []const u8) []const u8 {
+    if (std.mem.eql(u8, connection, "keep-alive")) return keep_alive;
+    return close;
+}
 
 const CliError = error{
     MissingValue,
@@ -464,7 +698,9 @@ fn runServeCommand(
     installShutdownHandlers();
     var logger = try Logger.init(allocator, io, config);
     defer logger.deinit();
-    try serve(std.heap.smp_allocator, io, config, &logger);
+    var cache = StaticCache.init(std.heap.smp_allocator, config);
+    defer cache.deinit();
+    try serve(std.heap.smp_allocator, io, config, &logger, &cache);
 }
 
 fn loadArgs(allocator: Allocator, io: Io, init_args: std.process.Args) !LoadedArgs {
@@ -1200,7 +1436,7 @@ fn checkConfig(io: Io, config: Config) !void {
     try writer.flush();
 }
 
-fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger) !void {
+fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *StaticCache) !void {
     var address = try IpAddress.parse(config.host, config.port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -1236,6 +1472,7 @@ fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger) !void {
             .stream = stream,
             .config = config,
             .logger = logger,
+            .cache = cache,
             .active_connections = &active_connections,
         };
 
@@ -1288,7 +1525,7 @@ fn connectionWorker(context: *ConnectionContext) void {
     };
     defer root.close(context.io);
 
-    handleConnection(context.allocator, context.io, root, context.stream, context.config, context.logger) catch |err| {
+    handleConnection(context.allocator, context.io, root, context.stream, context.config, context.logger, context.cache) catch |err| {
         context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
     };
 }
@@ -1304,7 +1541,7 @@ fn sendBusy(io: Io, stream: Io.net.Stream) !void {
     try writer.interface.flush();
 }
 
-fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger) !void {
+fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger, cache: *StaticCache) !void {
     defer stream.close(io);
 
     var remote_buffer: [128]u8 = undefined;
@@ -1410,6 +1647,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             is_head,
             response_connection,
             config,
+            cache,
         );
         access_record.status = result.status;
         access_record.bytes = result.bytes;
@@ -1779,7 +2017,12 @@ fn servePath(
     is_head: bool,
     connection: []const u8,
     config: Config,
+    cache: *StaticCache,
 ) !ResponseResult {
+    if (try cache.tryServe(io, root, out, stream_writer, relative_path, if_modified_since, is_head, connection)) |result| {
+        return result;
+    }
+
     var file = root.openFile(io, relative_path, .{
         .mode = .read_only,
         .allow_directory = false,
@@ -1794,7 +2037,7 @@ fn servePath(
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config);
+            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config, cache);
         },
         error.AccessDenied => {
             return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
@@ -1851,6 +2094,18 @@ fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
         };
         if (n == 0) break;
         try out.writeAll(file_buffer[0..n]);
+    }
+}
+
+fn readFileBody(io: Io, file: Io.File, body: []u8) !void {
+    var offset: usize = 0;
+    var reader = file.reader(io, &.{});
+    while (offset < body.len) {
+        const n = reader.interface.readSliceShort(body[offset..]) catch |err| switch (err) {
+            error.ReadFailed => return reader.err orelse err,
+        };
+        if (n == 0) return error.EndOfStream;
+        offset += n;
     }
 }
 
@@ -1914,6 +2169,35 @@ fn sendHeaders(
         try out.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     try out.writeAll("\r\n");
+}
+
+fn buildHeaderAlloc(
+    allocator: Allocator,
+    status: ResponseStatus,
+    content_type: []const u8,
+    content_length: u64,
+    connection: []const u8,
+    allow: ?[]const u8,
+    extra_headers: []const Header,
+    last_modified: ?[]const u8,
+    location: ?[]const u8,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.print(allocator, "HTTP/1.1 {d} {s}\r\n", .{ status.code, status.reason });
+    try output.print(allocator, "Server: {s}\r\n", .{server_name});
+    try output.print(allocator, "Content-Type: {s}\r\n", .{content_type});
+    try output.print(allocator, "Content-Length: {d}\r\n", .{content_length});
+    try output.print(allocator, "Connection: {s}\r\n", .{connection});
+    try output.appendSlice(allocator, "X-Content-Type-Options: nosniff\r\n");
+    if (allow) |value| try output.print(allocator, "Allow: {s}\r\n", .{value});
+    if (last_modified) |value| try output.print(allocator, "Last-Modified: {s}\r\n", .{value});
+    if (location) |value| try output.print(allocator, "Location: {s}\r\n", .{value});
+    for (extra_headers) |header| {
+        try output.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    try output.appendSlice(allocator, "\r\n");
+    return try output.toOwnedSlice(allocator);
 }
 
 fn mimeType(path: []const u8) []const u8 {
@@ -2178,6 +2462,31 @@ test "json log string escaping" {
 
     try appendJsonString(&output, allocator, "a\"b\\c\n");
     try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\n\"", output.items);
+}
+
+test "prebuilt cached headers preserve response fields" {
+    const allocator = std.testing.allocator;
+    const extra_headers = [_]Header{.{ .name = "Cache-Control", .value = "public, max-age=60" }};
+    const header = try buildHeaderAlloc(
+        allocator,
+        .{ .code = 200, .reason = "OK" },
+        "text/html; charset=utf-8",
+        123,
+        "keep-alive",
+        null,
+        &extra_headers,
+        "Thu, 01 Jan 1970 00:00:00 GMT",
+        null,
+    );
+    defer allocator.free(header);
+
+    try std.testing.expect(std.mem.indexOf(u8, header, "HTTP/1.1 200 OK\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Content-Length: 123\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Connection: keep-alive\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "X-Content-Type-Options: nosniff\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "Cache-Control: public, max-age=60\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, header, "\r\n\r\n"));
 }
 
 test "json config applies values and cli overrides" {
