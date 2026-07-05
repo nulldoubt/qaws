@@ -15,6 +15,7 @@ const default_cache_max_file_bytes: usize = 256 * 1024;
 const default_cache_max_total_bytes: usize = 16 * 1024 * 1024;
 const default_cache_revalidate_ms: u32 = 1000;
 const worker_stack_size = 512 * 1024;
+const log_queue_capacity = 4096;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
@@ -272,6 +273,85 @@ const WorkerQueue = struct {
 
         self.closed = true;
         self.condition.broadcast(self.io);
+    }
+};
+
+const LogQueue = struct {
+    allocator: Allocator,
+    io: Io,
+    buffer: [][]u8,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    closed: bool = false,
+    mutex: Io.Mutex = .init,
+    not_empty: Io.Condition = .init,
+    not_full: Io.Condition = .init,
+
+    fn init(allocator: Allocator, io: Io, capacity: usize) !LogQueue {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .buffer = try allocator.alloc([]u8, capacity),
+        };
+    }
+
+    fn deinit(self: *LogQueue) void {
+        while (self.pop()) |line| self.allocator.free(line);
+        self.allocator.free(self.buffer);
+    }
+
+    fn pushBlocking(self: *LogQueue, line: []u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        while (self.count == self.buffer.len and !self.closed) {
+            self.not_full.waitUncancelable(self.io, &self.mutex);
+        }
+        if (self.closed) return false;
+        self.pushLocked(line);
+        return true;
+    }
+
+    fn tryPush(self: *LogQueue, line: []u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.closed or self.count == self.buffer.len) return false;
+        self.pushLocked(line);
+        return true;
+    }
+
+    fn pop(self: *LogQueue) ?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        while (self.count == 0 and !self.closed) {
+            self.not_empty.waitUncancelable(self.io, &self.mutex);
+        }
+        if (self.count == 0) return null;
+
+        const line = self.buffer[self.head];
+        self.head = (self.head + 1) % self.buffer.len;
+        self.count -= 1;
+        self.not_full.signal(self.io);
+        return line;
+    }
+
+    fn close(self: *LogQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.closed = true;
+        self.not_empty.broadcast(self.io);
+        self.not_full.broadcast(self.io);
+    }
+
+    fn pushLocked(self: *LogQueue, line: []u8) void {
+        self.buffer[self.tail] = line;
+        self.tail = (self.tail + 1) % self.buffer.len;
+        self.count += 1;
+        self.not_empty.signal(self.io);
     }
 };
 
@@ -538,7 +618,9 @@ const Logger = struct {
     offset: u64 = 0,
     format: LogFormat,
     access_enabled: bool,
-    mutex: Io.Mutex = .init,
+    queue: LogQueue,
+    thread: ?std.Thread = null,
+    dropped_access: std.atomic.Value(u64) = .init(0),
 
     fn init(allocator: Allocator, io: Io, config: Config) !Logger {
         if (config.log_file) |path| {
@@ -554,6 +636,7 @@ const Logger = struct {
                 .offset = stat.size,
                 .format = config.log_format,
                 .access_enabled = config.access_log,
+                .queue = try LogQueue.init(allocator, io, log_queue_capacity),
             };
         }
 
@@ -564,10 +647,25 @@ const Logger = struct {
             .owns_file = false,
             .format = config.log_format,
             .access_enabled = config.access_log,
+            .queue = try LogQueue.init(allocator, io, log_queue_capacity),
         };
     }
 
+    fn start(self: *Logger) !void {
+        self.thread = try std.Thread.spawn(.{
+            .stack_size = worker_stack_size,
+            .allocator = self.allocator,
+        }, loggerThread, .{self});
+    }
+
     fn deinit(self: *Logger) void {
+        const dropped = self.dropped_access.load(.monotonic);
+        if (dropped > 0) {
+            self.event("warn", "dropped {d} access log lines", .{dropped}) catch {};
+        }
+        self.queue.close();
+        if (self.thread) |thread| thread.join();
+        self.queue.deinit();
         if (self.owns_file) {
             self.file.close(self.io);
         }
@@ -598,7 +696,11 @@ const Logger = struct {
             },
         }
 
-        try self.writeLine(line.items);
+        const owned = try line.toOwnedSlice(self.allocator);
+        if (!self.queue.pushBlocking(owned)) {
+            self.allocator.free(owned);
+            return error.LogClosed;
+        }
     }
 
     fn access(self: *Logger, record: AccessRecord) void {
@@ -643,13 +745,14 @@ const Logger = struct {
             },
         }
 
-        self.writeLine(line.items) catch {};
+        const owned = line.toOwnedSlice(self.allocator) catch return;
+        if (!self.queue.tryPush(owned)) {
+            self.allocator.free(owned);
+            _ = self.dropped_access.fetchAdd(1, .monotonic);
+        }
     }
 
-    fn writeLine(self: *Logger, line: []const u8) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-
+    fn writeLineDirect(self: *Logger, line: []const u8) !void {
         if (self.owns_file) {
             try self.file.writePositionalAll(self.io, line, self.offset);
             self.offset += line.len;
@@ -662,6 +765,13 @@ const Logger = struct {
         try writer.flush();
     }
 };
+
+fn loggerThread(logger: *Logger) void {
+    while (logger.queue.pop()) |line| {
+        logger.writeLineDirect(line) catch {};
+        logger.allocator.free(line);
+    }
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -770,6 +880,7 @@ fn runServeCommand(
     installShutdownHandlers();
     var logger = try Logger.init(allocator, io, config);
     defer logger.deinit();
+    try logger.start();
     var cache = StaticCache.init(std.heap.smp_allocator, config);
     defer cache.deinit();
     try serve(std.heap.smp_allocator, io, config, &logger, &cache);
@@ -2480,6 +2591,56 @@ test "worker queue push pop and close behavior" {
     queue.close();
     try std.testing.expect(!queue.push(fake_stream));
     try std.testing.expect(queue.pop() == null);
+}
+
+test "log queue preserves events and reports full access queue" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var queue = try LogQueue.init(allocator, io, 1);
+    defer queue.deinit();
+
+    const first = try allocator.dupe(u8, "event\n");
+    try std.testing.expect(queue.pushBlocking(first));
+    const second = try allocator.dupe(u8, "access\n");
+    try std.testing.expect(!queue.tryPush(second));
+    allocator.free(second);
+
+    const popped = queue.pop().?;
+    try std.testing.expectEqualStrings("event\n", popped);
+    allocator.free(popped);
+    queue.close();
+    try std.testing.expect(queue.pop() == null);
+}
+
+test "async access logger drops when queue is full" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var logger = Logger{
+        .allocator = allocator,
+        .io = io,
+        .file = std.Io.File.stderr(),
+        .owns_file = false,
+        .format = .plain,
+        .access_enabled = true,
+        .queue = try LogQueue.init(allocator, io, 1),
+    };
+    defer {
+        logger.queue.close();
+        logger.queue.deinit();
+    }
+
+    const record = AccessRecord{
+        .remote = "127.0.0.1:1",
+        .method = "GET",
+        .target = "/",
+        .status = 200,
+        .bytes = 5,
+        .duration_us = 10,
+        .user_agent = "test",
+    };
+    logger.access(record);
+    logger.access(record);
+    try std.testing.expectEqual(@as(u64, 1), logger.dropped_access.load(.monotonic));
 }
 
 test "connection accounting enforces configured cap" {
