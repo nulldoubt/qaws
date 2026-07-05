@@ -10,7 +10,7 @@ const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 const default_keep_alive_timeout_ms: u32 = 5000;
 const default_max_requests_per_connection: u32 = 1000;
-const default_max_connections: u32 = 128;
+const default_max_connections: u32 = 1024;
 const default_cache_max_file_bytes: usize = 256 * 1024;
 const default_cache_max_total_bytes: usize = 16 * 1024 * 1024;
 const default_cache_revalidate_ms: u32 = 1000;
@@ -44,6 +44,7 @@ const Config = struct {
     keep_alive_timeout_ms: u32 = default_keep_alive_timeout_ms,
     max_requests_per_connection: u32 = default_max_requests_per_connection,
     max_connections: u32 = default_max_connections,
+    workers: u32 = 0,
     cache_enabled: bool = true,
     cache_max_file_bytes: usize = default_cache_max_file_bytes,
     cache_max_total_bytes: usize = default_cache_max_total_bytes,
@@ -96,6 +97,7 @@ const CliOptions = struct {
     keep_alive_timeout_ms: ?u32 = null,
     max_requests_per_connection: ?u32 = null,
     max_connections: ?u32 = null,
+    workers: ?u32 = null,
     force: bool = false,
 };
 
@@ -150,6 +152,7 @@ const HttpConfig = struct {
     keep_alive_timeout_ms: ?u32 = null,
     max_requests_per_connection: ?u32 = null,
     max_connections: ?u32 = null,
+    workers: ?u32 = null,
 };
 
 const HttpVersion = enum {
@@ -848,6 +851,10 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             cli.max_connections = parseU32Limit(normalizeArg(args[i])) catch return error.InvalidHttpLimit;
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.workers = parseU32Limit(normalizeArg(args[i])) catch return error.InvalidHttpLimit;
         } else if (std.mem.eql(u8, arg, "-d")) {
             cli.daemon = true;
         } else if (std.mem.eql(u8, arg, "check")) {
@@ -909,6 +916,7 @@ fn applyCliOverrides(config: *Config, cli: CliOptions) void {
     if (cli.keep_alive_timeout_ms) |value| config.keep_alive_timeout_ms = value;
     if (cli.max_requests_per_connection) |value| config.max_requests_per_connection = value;
     if (cli.max_connections) |value| config.max_connections = value;
+    if (cli.workers) |value| config.workers = value;
 }
 
 fn loadConfigFile(allocator: Allocator, io: Io, path: []const u8, config: *Config) !void {
@@ -981,6 +989,10 @@ fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Confi
         if (http.max_connections) |max_connections| {
             if (max_connections == 0) return error.InvalidHttpConfig;
             config.max_connections = max_connections;
+        }
+        if (http.workers) |workers| {
+            if (workers == 0) return error.InvalidHttpConfig;
+            config.workers = workers;
         }
     }
 
@@ -1407,6 +1419,7 @@ fn printHelp() !void {
         \\  --keep-alive-timeout-ms <n>
         \\  --max-requests-per-connection <n>
         \\  --max-connections <n>
+        \\  --workers <n>
         \\  --access-log
         \\  --no-access-log
         \\
@@ -2422,6 +2435,8 @@ test "parse cli serve options" {
         "500",
         "--max-connections",
         "256",
+        "--workers",
+        "3",
         "-d",
     };
     const command = try parseArgs(args);
@@ -2437,6 +2452,7 @@ test "parse cli serve options" {
             try std.testing.expectEqual(@as(u32, 1500), config.keep_alive_timeout_ms);
             try std.testing.expectEqual(@as(u32, 500), config.max_requests_per_connection);
             try std.testing.expectEqual(@as(u32, 256), config.max_connections);
+            try std.testing.expectEqual(@as(u32, 3), config.workers);
             try std.testing.expect(config.daemon);
         },
         else => return error.TestExpectedEqual,
@@ -2509,7 +2525,8 @@ test "json config applies values and cli overrides" {
         \\    "keep_alive": false,
         \\    "keep_alive_timeout_ms": 2000,
         \\    "max_requests_per_connection": 100,
-        \\    "max_connections": 64
+        \\    "max_connections": 64,
+        \\    "workers": 2
         \\  }
         \\}
     ;
@@ -2540,6 +2557,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
+    try std.testing.expectEqual(@as(u32, 2), config.workers);
     try std.testing.expect(!config.cache_enabled);
     try std.testing.expectEqual(@as(usize, 1024), config.cache_max_file_bytes);
     try std.testing.expectEqual(@as(usize, 4096), config.cache_max_total_bytes);
@@ -2554,6 +2572,7 @@ test "json config applies values and cli overrides" {
         .keep_alive_timeout_ms = 3000,
         .max_requests_per_connection = 600,
         .max_connections = 128,
+        .workers = 4,
     });
     try std.testing.expectEqualStrings("0.0.0.0", config.host);
     try std.testing.expectEqual(@as(u16, 9090), config.port);
@@ -2563,6 +2582,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expectEqual(@as(u32, 3000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 600), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 128), config.max_connections);
+    try std.testing.expectEqual(@as(u32, 4), config.workers);
 }
 
 test "json config rejects unknown keys and invalid headers" {
@@ -2598,6 +2618,12 @@ test "json config rejects invalid http limits" {
 
     var config = Config{};
     try std.testing.expectError(error.InvalidHttpConfig, applyFileConfig(allocator, parsed.value, &config));
+
+    var parsed_workers = try std.json.parseFromSlice(FileConfig, allocator, "{ \"http\": { \"workers\": 0 } }", .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed_workers.deinit();
+    try std.testing.expectError(error.InvalidHttpConfig, applyFileConfig(allocator, parsed_workers.value, &config));
 }
 
 test "json config rejects invalid cache limits" {
