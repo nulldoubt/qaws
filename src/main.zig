@@ -11,6 +11,9 @@ const max_request_bytes = 16 * 1024;
 const default_keep_alive_timeout_ms: u32 = 5000;
 const default_max_requests_per_connection: u32 = 1000;
 const default_max_connections: u32 = 128;
+const default_cache_max_file_bytes: usize = 256 * 1024;
+const default_cache_max_total_bytes: usize = 16 * 1024 * 1024;
+const default_cache_revalidate_ms: u32 = 1000;
 const worker_stack_size = 512 * 1024;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -41,6 +44,10 @@ const Config = struct {
     keep_alive_timeout_ms: u32 = default_keep_alive_timeout_ms,
     max_requests_per_connection: u32 = default_max_requests_per_connection,
     max_connections: u32 = default_max_connections,
+    cache_enabled: bool = true,
+    cache_max_file_bytes: usize = default_cache_max_file_bytes,
+    cache_max_total_bytes: usize = default_cache_max_total_bytes,
+    cache_revalidate_ms: u32 = default_cache_revalidate_ms,
     headers: []const Header = &.{},
 };
 
@@ -86,6 +93,9 @@ const CliOptions = struct {
     access_log: ?bool = null,
     pid_file: ?[]const u8 = null,
     keep_alive: ?bool = null,
+    keep_alive_timeout_ms: ?u32 = null,
+    max_requests_per_connection: ?u32 = null,
+    max_connections: ?u32 = null,
     force: bool = false,
 };
 
@@ -95,6 +105,7 @@ const FileConfig = struct {
     daemon: ?DaemonConfig = null,
     logging: ?LoggingConfig = null,
     security: ?SecurityConfig = null,
+    cache: ?CacheConfig = null,
     headers: ?std.json.Value = null,
     http: ?HttpConfig = null,
 };
@@ -123,6 +134,13 @@ const DotfilePolicy = enum {
 
 const SecurityConfig = struct {
     dotfiles: ?DotfilePolicy = null,
+};
+
+const CacheConfig = struct {
+    enabled: ?bool = null,
+    max_file_bytes: ?usize = null,
+    max_total_bytes: ?usize = null,
+    revalidate_ms: ?u32 = null,
 };
 
 const HttpConfig = struct {
@@ -187,6 +205,7 @@ const ConnectionContext = struct {
 const CliError = error{
     MissingValue,
     InvalidPort,
+    InvalidHttpLimit,
     InvalidLogFormat,
     UnknownArgument,
 };
@@ -581,6 +600,18 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
             cli.keep_alive = true;
         } else if (std.mem.eql(u8, arg, "--no-keep-alive")) {
             cli.keep_alive = false;
+        } else if (std.mem.eql(u8, arg, "--keep-alive-timeout-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.keep_alive_timeout_ms = parseU32Limit(normalizeArg(args[i])) catch return error.InvalidHttpLimit;
+        } else if (std.mem.eql(u8, arg, "--max-requests-per-connection")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.max_requests_per_connection = parseU32Limit(normalizeArg(args[i])) catch return error.InvalidHttpLimit;
+        } else if (std.mem.eql(u8, arg, "--max-connections")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.max_connections = parseU32Limit(normalizeArg(args[i])) catch return error.InvalidHttpLimit;
         } else if (std.mem.eql(u8, arg, "-d")) {
             cli.daemon = true;
         } else if (std.mem.eql(u8, arg, "check")) {
@@ -603,6 +634,12 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
     }
 
     return cli;
+}
+
+fn parseU32Limit(value: []const u8) !u32 {
+    const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidHttpLimit;
+    if (parsed == 0) return error.InvalidHttpLimit;
+    return parsed;
 }
 
 fn resolveCommand(allocator: Allocator, io: Io, cli: CliOptions) !ParsedCommand {
@@ -633,6 +670,9 @@ fn applyCliOverrides(config: *Config, cli: CliOptions) void {
     if (cli.access_log) |value| config.access_log = value;
     if (cli.pid_file) |value| config.pid_file = value;
     if (cli.keep_alive) |value| config.keep_alive = value;
+    if (cli.keep_alive_timeout_ms) |value| config.keep_alive_timeout_ms = value;
+    if (cli.max_requests_per_connection) |value| config.max_requests_per_connection = value;
+    if (cli.max_connections) |value| config.max_connections = value;
 }
 
 fn loadConfigFile(allocator: Allocator, io: Io, path: []const u8, config: *Config) !void {
@@ -672,6 +712,22 @@ fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Confi
 
     if (file_config.security) |security| {
         if (security.dotfiles) |dotfiles| config.dotfiles = dotfiles;
+    }
+
+    if (file_config.cache) |cache| {
+        if (cache.enabled) |enabled| config.cache_enabled = enabled;
+        if (cache.max_file_bytes) |max_file_bytes| {
+            if (max_file_bytes == 0) return error.InvalidCacheConfig;
+            config.cache_max_file_bytes = max_file_bytes;
+        }
+        if (cache.max_total_bytes) |max_total_bytes| {
+            if (max_total_bytes == 0) return error.InvalidCacheConfig;
+            config.cache_max_total_bytes = max_total_bytes;
+        }
+        if (cache.revalidate_ms) |revalidate_ms| {
+            if (revalidate_ms == 0) return error.InvalidCacheConfig;
+            config.cache_revalidate_ms = revalidate_ms;
+        }
     }
 
     if (file_config.http) |http| {
@@ -1047,6 +1103,7 @@ fn printCliError(err: CliError) !void {
     switch (err) {
         error.MissingValue => try out.writeAll("qaws: missing value for option\n"),
         error.InvalidPort => try out.writeAll("qaws: port must be a number from 1 to 65535\n"),
+        error.InvalidHttpLimit => try out.writeAll("qaws: HTTP limits must be positive numbers\n"),
         error.InvalidLogFormat => try out.writeAll("qaws: log format must be plain or jsonl\n"),
         error.UnknownArgument => try out.writeAll("qaws: unknown argument\n"),
     }
@@ -1978,6 +2035,12 @@ test "parse cli serve options" {
         "qaws.log",
         "--no-access-log",
         "--no-keep-alive",
+        "--keep-alive-timeout-ms",
+        "1500",
+        "--max-requests-per-connection",
+        "500",
+        "--max-connections",
+        "256",
         "-d",
     };
     const command = try parseArgs(args);
@@ -1990,6 +2053,9 @@ test "parse cli serve options" {
             try std.testing.expectEqualStrings("qaws.log", config.log_file.?);
             try std.testing.expect(!config.access_log);
             try std.testing.expect(!config.keep_alive);
+            try std.testing.expectEqual(@as(u32, 1500), config.keep_alive_timeout_ms);
+            try std.testing.expectEqual(@as(u32, 500), config.max_requests_per_connection);
+            try std.testing.expectEqual(@as(u32, 256), config.max_connections);
             try std.testing.expect(config.daemon);
         },
         else => return error.TestExpectedEqual,
@@ -2029,6 +2095,7 @@ test "json config applies values and cli overrides" {
         \\  "daemon": { "enabled": true, "pid_file": "qaws.pid", "log_file": "qaws.log" },
         \\  "logging": { "format": "jsonl", "access": false },
         \\  "security": { "dotfiles": "deny_all" },
+        \\  "cache": { "enabled": false, "max_file_bytes": 1024, "max_total_bytes": 4096, "revalidate_ms": 250 },
         \\  "headers": { "Cache-Control": "public, max-age=60" },
         \\  "http": {
         \\    "last_modified": false,
@@ -2067,6 +2134,10 @@ test "json config applies values and cli overrides" {
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
+    try std.testing.expect(!config.cache_enabled);
+    try std.testing.expectEqual(@as(usize, 1024), config.cache_max_file_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), config.cache_max_total_bytes);
+    try std.testing.expectEqual(@as(u32, 250), config.cache_revalidate_ms);
 
     applyCliOverrides(&config, .{
         .host = "0.0.0.0",
@@ -2074,12 +2145,18 @@ test "json config applies values and cli overrides" {
         .serve_dir = "public",
         .access_log = true,
         .keep_alive = true,
+        .keep_alive_timeout_ms = 3000,
+        .max_requests_per_connection = 600,
+        .max_connections = 128,
     });
     try std.testing.expectEqualStrings("0.0.0.0", config.host);
     try std.testing.expectEqual(@as(u16, 9090), config.port);
     try std.testing.expectEqualStrings("public", config.serve_dir);
     try std.testing.expect(config.access_log);
     try std.testing.expect(config.keep_alive);
+    try std.testing.expectEqual(@as(u32, 3000), config.keep_alive_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 600), config.max_requests_per_connection);
+    try std.testing.expectEqual(@as(u32, 128), config.max_connections);
 }
 
 test "json config rejects unknown keys and invalid headers" {
@@ -2115,6 +2192,24 @@ test "json config rejects invalid http limits" {
 
     var config = Config{};
     try std.testing.expectError(error.InvalidHttpConfig, applyFileConfig(allocator, parsed.value, &config));
+}
+
+test "json config rejects invalid cache limits" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(FileConfig, allocator, "{ \"cache\": { \"max_file_bytes\": 0 } }", .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+
+    var config = Config{};
+    try std.testing.expectError(error.InvalidCacheConfig, applyFileConfig(allocator, parsed.value, &config));
+
+    try std.testing.expectError(
+        error.UnknownField,
+        std.json.parseFromSlice(FileConfig, allocator, "{ \"cache\": { \"unknown\": true } }", .{
+            .ignore_unknown_fields = false,
+        }),
+    );
 }
 
 test "http keep-alive decisions follow protocol defaults" {

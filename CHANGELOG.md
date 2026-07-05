@@ -2,6 +2,7 @@
 
 ### 0.2.2
 
+- Added strict JSON cache settings and CLI overrides for HTTP connection limits.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.2.
 
 ### 0.2.1
