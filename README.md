@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.3`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, bounded connection workers, static file serving, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, a fixed worker pool, async log writing, static file serving, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -43,7 +43,8 @@ Defaults:
 | `--keep-alive` / `--no-keep-alive` | keep-alive on | Enable or disable HTTP persistent connections. |
 | `--keep-alive-timeout-ms <n>` | `5000` | Idle timeout for persistent connections. |
 | `--max-requests-per-connection <n>` | `1000` | Maximum requests before recycling one persistent connection. |
-| `--max-connections <n>` | `128` | Maximum concurrent connection workers. |
+| `--max-connections <n>` | `1024` | Maximum active plus queued connections. |
+| `--workers <n>` | logical CPU count | Fixed worker thread count. |
 | `--access-log` / `--no-access-log` | access logs on | Enable or disable per-request access logs. |
 | `--pid-file <path>` | derived in daemon mode | PID file for daemon start/status/stop/restart. |
 
@@ -99,6 +100,7 @@ qaws 0.2.3
 - HTTP/1.1 keeps connections alive by default.
 - HTTP/1.0 closes by default unless the client sends `Connection: keep-alive`.
 - `Connection: close` always closes after the response.
+- HTTP/1.1 pipelined requests are processed sequentially and responses are sent in request order.
 - Requests with bodies are rejected because qaws only serves static files.
 - Directory listings are never generated.
 - There is no SPA fallback. A missing route stays missing.
@@ -145,7 +147,8 @@ Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`
     "keep_alive": true,
     "keep_alive_timeout_ms": 5000,
     "max_requests_per_connection": 1000,
-    "max_connections": 128
+    "max_connections": 1024,
+    "workers": 4
   }
 }
 ```
@@ -194,14 +197,16 @@ qaws uses persistent HTTP connections by default:
 - Keep-alive is enabled unless `--no-keep-alive` or `"keep_alive": false` is set.
 - Idle keep-alive connections time out after `5000` ms by default.
 - A single connection is recycled after `1000` requests by default.
-- The server accepts up to `128` concurrent connection workers by default.
+- A fixed worker pool handles accepted connections; the default worker count is the detected logical CPU count, falling back to `1`.
+- The server accepts up to `1024` active plus queued connections by default.
 - When the connection cap is reached, qaws returns `503 Service Unavailable` with `Connection: close`.
+- HTTP/1.1 pipelined requests on one connection are served sequentially in request order.
 
-These defaults are intentionally conservative enough for Termux and small VPS use, while still avoiding the heavy connection churn seen in one-request-per-connection benchmarks.
+These defaults stay usable on Termux and small VPS machines while avoiding per-connection thread creation overhead.
 
 ## Logging
 
-Foreground logs go to stderr unless `--log-file` is set. Daemon logs use `--log-file` or a derived runtime log path.
+Foreground logs go to stderr unless `--log-file` is set. Daemon logs use `--log-file` or a derived runtime log path. Log writes are handled by one background logger thread. Event logs are preserved and drained on shutdown; access logs are non-blocking and may be dropped if the internal queue is full.
 
 Plain logs are human-readable:
 
@@ -478,6 +483,10 @@ To compare cached and uncached static serving, run once with the default cache a
 ```json
 { "cache": { "enabled": false } }
 ```
+
+## Roadmap
+
+The next performance releases are expected to focus on platform file-transfer paths such as `sendfile` on macOS/BSD/Linux, then event-loop backends such as epoll and kqueue/kevent. Later cache work may add eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
 
 ## Troubleshooting
 
