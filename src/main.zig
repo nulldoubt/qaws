@@ -1312,6 +1312,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
 
     var reader_buffer: [4096]u8 = undefined;
     var reader = ConnectionReader.init(io, stream, &reader_buffer);
+    var request_buffer: [max_request_bytes]u8 = undefined;
     var writer_buffer: [8192]u8 = undefined;
     var writer = stream.writer(io, &writer_buffer);
     const out = &writer.interface;
@@ -1329,7 +1330,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             .user_agent = null,
         };
 
-        const request_bytes = readHttpRequest(allocator, &reader, keepAliveTimeout(config)) catch |err| switch (err) {
+        const request_bytes = readHttpRequest(&reader, keepAliveTimeout(config), &request_buffer) catch |err| switch (err) {
             error.Timeout, error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => return,
             error.RequestTooLarge => {
                 const result = try sendSimple(out, &writer, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n", "close");
@@ -1346,7 +1347,6 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
                 return;
             },
         };
-        defer allocator.free(request_bytes);
 
         const request = parseRequest(request_bytes) catch {
             const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
@@ -1383,16 +1383,20 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             return;
         }
 
-        const relative_path = normalizeTarget(allocator, request.target, config.dotfiles) catch {
-            const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
-            access_record.status = result.status;
-            access_record.bytes = result.bytes;
-            finishAccessLog(logger, io, start, &access_record);
-            if (!keep_open) return;
-            served_requests = current_request_count;
-            continue;
+        var relative_path_owned: ?[]u8 = null;
+        defer if (relative_path_owned) |path| allocator.free(path);
+        const relative_path = normalizeTargetFast(request.target, config.dotfiles) orelse blk: {
+            relative_path_owned = normalizeTarget(allocator, request.target, config.dotfiles) catch {
+                const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
+                access_record.status = result.status;
+                access_record.bytes = result.bytes;
+                finishAccessLog(logger, io, start, &access_record);
+                if (!keep_open) return;
+                served_requests = current_request_count;
+                continue;
+            };
+            break :blk relative_path_owned.?;
         };
-        defer allocator.free(relative_path);
 
         const result = try servePath(
             allocator,
@@ -1437,17 +1441,11 @@ const ConnectionReader = struct {
         };
     }
 
-    fn takeByte(self: *ConnectionReader, timeout: Io.Timeout) !u8 {
-        if (self.start >= self.end) {
-            const message = try self.stream.socket.receiveTimeout(self.io, self.buffer, timeout);
-            if (message.data.len == 0) return error.EndOfStream;
-            self.start = 0;
-            self.end = message.data.len;
-        }
-
-        const byte = self.buffer[self.start];
-        self.start += 1;
-        return byte;
+    fn refill(self: *ConnectionReader, timeout: Io.Timeout) !void {
+        const message = try self.stream.socket.receiveTimeout(self.io, self.buffer, timeout);
+        if (message.data.len == 0) return error.EndOfStream;
+        self.start = 0;
+        self.end = message.data.len;
     }
 };
 
@@ -1458,19 +1456,52 @@ fn keepAliveTimeout(config: Config) Io.Timeout {
     } };
 }
 
-fn readHttpRequest(allocator: Allocator, reader: *ConnectionReader, timeout: Io.Timeout) ![]u8 {
-    var data = try std.ArrayList(u8).initCapacity(allocator, 1024);
-    errdefer data.deinit(allocator);
+const RequestReadStep = struct {
+    complete: bool,
+    request_len: usize,
+    consumed: usize,
+};
 
-    while (data.items.len < max_request_bytes) {
-        const byte = try reader.takeByte(timeout);
-        try data.append(allocator, byte);
-        if (data.items.len >= 4 and std.mem.eql(u8, data.items[data.items.len - 4 ..], "\r\n\r\n")) {
-            return try data.toOwnedSlice(allocator);
+fn readHttpRequest(reader: *ConnectionReader, timeout: Io.Timeout, request_buffer: []u8) ![]const u8 {
+    var request_len: usize = 0;
+
+    while (true) {
+        if (reader.start >= reader.end) {
+            try reader.refill(timeout);
         }
+
+        const step = try appendRequestChunk(request_buffer, &request_len, reader.buffer[reader.start..reader.end]);
+        reader.start += step.consumed;
+        if (step.complete) return request_buffer[0..step.request_len];
+    }
+}
+
+fn appendRequestChunk(request_buffer: []u8, request_len: *usize, chunk: []const u8) !RequestReadStep {
+    const old_len = request_len.*;
+    const room = request_buffer.len - old_len;
+    const copied = @min(room, chunk.len);
+    if (copied != 0) {
+        @memcpy(request_buffer[old_len..][0..copied], chunk[0..copied]);
+    }
+    const new_len = old_len + copied;
+    const search_start = if (old_len > 3) old_len - 3 else 0;
+    if (std.mem.indexOf(u8, request_buffer[search_start..new_len], "\r\n\r\n")) |rel| {
+        const request_end = search_start + rel + 4;
+        request_len.* = request_end;
+        return .{
+            .complete = true,
+            .request_len = request_end,
+            .consumed = request_end - old_len,
+        };
     }
 
-    return error.RequestTooLarge;
+    request_len.* = new_len;
+    if (copied == room) return error.RequestTooLarge;
+    return .{
+        .complete = false,
+        .request_len = new_len,
+        .consumed = copied,
+    };
 }
 
 fn parseRequest(bytes: []const u8) !Request {
@@ -1597,6 +1628,35 @@ fn normalizeTarget(allocator: Allocator, target: []const u8, dotfiles: DotfilePo
     }
 
     return try output.toOwnedSlice(allocator);
+}
+
+fn normalizeTargetFast(target: []const u8, dotfiles: DotfilePolicy) ?[]const u8 {
+    if (std.mem.eql(u8, target, "/")) return "index.html";
+    if (std.mem.eql(u8, target, "/index.html")) return "index.html";
+    if (target.len < 2 or target[0] != '/') return null;
+    if (target[target.len - 1] == '/') return null;
+
+    var segment_start: usize = 1;
+    var i: usize = 1;
+    while (i < target.len) : (i += 1) {
+        switch (target[i]) {
+            '?', '#', '%', '\\', 0 => return null,
+            '/' => {
+                if (!isFastSafeSegment(target[segment_start..i], dotfiles)) return null;
+                segment_start = i + 1;
+                if (segment_start >= target.len) return null;
+            },
+            else => {},
+        }
+    }
+    if (!isFastSafeSegment(target[segment_start..], dotfiles)) return null;
+    return target[1..];
+}
+
+fn isFastSafeSegment(segment: []const u8, dotfiles: DotfilePolicy) bool {
+    if (segment.len == 0) return false;
+    if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    return !isDotfileSegment(segment, dotfiles);
 }
 
 fn isDotfileSegment(segment: []const u8, dotfiles: DotfilePolicy) bool {
@@ -1979,6 +2039,40 @@ test "normalize root and directory paths" {
     const nested = try normalizeTarget(allocator, "/docs/", .deny_except_well_known);
     defer allocator.free(nested);
     try std.testing.expectEqualStrings("docs/index.html", nested);
+}
+
+test "fast normalize handles common safe targets" {
+    try std.testing.expectEqualStrings("index.html", normalizeTargetFast("/", .deny_except_well_known).?);
+    try std.testing.expectEqualStrings("index.html", normalizeTargetFast("/index.html", .deny_except_well_known).?);
+    try std.testing.expectEqualStrings("assets/app.css", normalizeTargetFast("/assets/app.css", .deny_except_well_known).?);
+    try std.testing.expectEqualStrings(".well-known/security.txt", normalizeTargetFast("/.well-known/security.txt", .deny_except_well_known).?);
+
+    try std.testing.expect(normalizeTargetFast("/docs/", .deny_except_well_known) == null);
+    try std.testing.expect(normalizeTargetFast("/a%2fb", .deny_except_well_known) == null);
+    try std.testing.expect(normalizeTargetFast("/../build.zig", .deny_except_well_known) == null);
+    try std.testing.expect(normalizeTargetFast("/.env", .deny_except_well_known) == null);
+    try std.testing.expect(normalizeTargetFast("/.well-known/security.txt", .deny_all) == null);
+}
+
+test "request chunk appender preserves keep-alive leftovers" {
+    var buffer: [max_request_bytes]u8 = undefined;
+    var len: usize = 0;
+    const first = "GET / HTTP/1.1\r\nHost: x\r\n";
+    var step = try appendRequestChunk(&buffer, &len, first);
+    try std.testing.expect(!step.complete);
+    try std.testing.expectEqual(first.len, step.consumed);
+
+    const second = "\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    step = try appendRequestChunk(&buffer, &len, second);
+    try std.testing.expect(step.complete);
+    try std.testing.expectEqualStrings("GET / HTTP/1.1\r\nHost: x\r\n\r\n", buffer[0..step.request_len]);
+    try std.testing.expectEqual(@as(usize, 2), step.consumed);
+}
+
+test "request chunk appender rejects oversized headers" {
+    var buffer: [8]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expectError(error.RequestTooLarge, appendRequestChunk(&buffer, &len, "123456789"));
 }
 
 test "normalize rejects traversal" {

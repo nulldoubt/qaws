@@ -2,6 +2,7 @@
 
 ### 0.2.2
 
+- Removed per-request request-buffer allocation and added fast normalization for simple safe paths.
 - Added strict JSON cache settings and CLI overrides for HTTP connection limits.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.2.
 
