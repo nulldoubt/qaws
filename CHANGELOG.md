@@ -2,6 +2,7 @@
 
 ### 0.2.1
 
+- Added HTTP keep-alive response handling with defensive close behavior for bad requests.
 - Added keep-alive configuration and HTTP `Connection` parsing rules.
 - Bumped qaws version metadata and documentation to 0.2.1.
 

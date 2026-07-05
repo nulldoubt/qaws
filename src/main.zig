@@ -1157,80 +1157,113 @@ fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
 fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger) !void {
     defer stream.close(io);
 
-    const start = Io.Timestamp.now(io, .awake);
     var remote_buffer: [128]u8 = undefined;
     const remote = formatRemoteAddress(stream.socket.address, &remote_buffer);
-    var access_record = AccessRecord{
-        .remote = remote,
-        .method = "-",
-        .target = "-",
-        .status = 500,
-        .bytes = 0,
-        .duration_us = 0,
-        .user_agent = null,
-    };
 
     var reader_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io, &reader_buffer);
+    var reader = ConnectionReader.init(io, stream, &reader_buffer);
     var writer_buffer: [8192]u8 = undefined;
     var writer = stream.writer(io, &writer_buffer);
     const out = &writer.interface;
+    var served_requests: u32 = 0;
 
-    const request_bytes = readHttpRequest(allocator, &reader) catch |err| {
-        const result = switch (err) {
-            error.RequestTooLarge => try sendSimple(out, &writer, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n"),
-            else => try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n"),
+    while (!shutdown_requested.load(.seq_cst)) {
+        const start = Io.Timestamp.now(io, .awake);
+        var access_record = AccessRecord{
+            .remote = remote,
+            .method = "-",
+            .target = "-",
+            .status = 500,
+            .bytes = 0,
+            .duration_us = 0,
+            .user_agent = null,
         };
+
+        const request_bytes = readHttpRequest(allocator, &reader, keepAliveTimeout(config)) catch |err| switch (err) {
+            error.Timeout, error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => return,
+            error.RequestTooLarge => {
+                const result = try sendSimple(out, &writer, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n", "close");
+                access_record.status = result.status;
+                access_record.bytes = result.bytes;
+                finishAccessLog(logger, io, start, &access_record);
+                return;
+            },
+            else => {
+                const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
+                access_record.status = result.status;
+                access_record.bytes = result.bytes;
+                finishAccessLog(logger, io, start, &access_record);
+                return;
+            },
+        };
+        defer allocator.free(request_bytes);
+
+        const request = parseRequest(request_bytes) catch {
+            const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
+            access_record.status = result.status;
+            access_record.bytes = result.bytes;
+            finishAccessLog(logger, io, start, &access_record);
+            return;
+        };
+        access_record.method = request.method;
+        access_record.target = request.target;
+        access_record.user_agent = request.user_agent;
+
+        const current_request_count = served_requests + 1;
+        var keep_open = requestWantsKeepAlive(request, config, current_request_count);
+        const response_connection = if (keep_open) "keep-alive" else "close";
+
+        if (request.has_request_body) {
+            const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
+            access_record.status = result.status;
+            access_record.bytes = result.bytes;
+            finishAccessLog(logger, io, start, &access_record);
+            return;
+        }
+
+        const is_head = std.mem.eql(u8, request.method, "HEAD");
+        if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
+            keep_open = false;
+            try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
+            try out.writeAll("Method not allowed\n");
+            try writer.interface.flush();
+            access_record.status = 405;
+            access_record.bytes = 19;
+            finishAccessLog(logger, io, start, &access_record);
+            return;
+        }
+
+        const relative_path = normalizeTarget(allocator, request.target, config.dotfiles) catch {
+            const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
+            access_record.status = result.status;
+            access_record.bytes = result.bytes;
+            finishAccessLog(logger, io, start, &access_record);
+            if (!keep_open) return;
+            served_requests = current_request_count;
+            continue;
+        };
+        defer allocator.free(relative_path);
+
+        const result = try servePath(
+            allocator,
+            io,
+            root,
+            out,
+            &writer,
+            relative_path,
+            request.target,
+            request.if_modified_since,
+            is_head,
+            response_connection,
+            config,
+        );
         access_record.status = result.status;
         access_record.bytes = result.bytes;
         finishAccessLog(logger, io, start, &access_record);
-        return;
-    };
-    defer allocator.free(request_bytes);
-    defer finishAccessLog(logger, io, start, &access_record);
 
-    const request = parseRequest(request_bytes) catch {
-        const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n");
-        access_record.status = result.status;
-        access_record.bytes = result.bytes;
-        return;
-    };
-    access_record.method = request.method;
-    access_record.target = request.target;
-    access_record.user_agent = request.user_agent;
-
-    const is_head = std.mem.eql(u8, request.method, "HEAD");
-    if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
-        try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
-        if (!is_head) try out.writeAll("Method not allowed\n");
-        try writer.interface.flush();
-        access_record.status = 405;
-        access_record.bytes = 19;
-        return;
+        served_requests = current_request_count;
+        if (!keep_open) return;
     }
-
-    const relative_path = normalizeTarget(allocator, request.target, config.dotfiles) catch {
-        const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
-        access_record.status = result.status;
-        access_record.bytes = result.bytes;
-        return;
-    };
-    defer allocator.free(relative_path);
-
-    const result = try servePath(
-        allocator,
-        io,
-        root,
-        out,
-        &writer,
-        relative_path,
-        request.target,
-        request.if_modified_since,
-        is_head,
-        config,
-    );
-    access_record.status = result.status;
-    access_record.bytes = result.bytes;
 }
 
 fn finishAccessLog(logger: *Logger, io: Io, start: Io.Timestamp, record: *AccessRecord) void {
@@ -1239,17 +1272,50 @@ fn finishAccessLog(logger: *Logger, io: Io, start: Io.Timestamp, record: *Access
     logger.access(record.*);
 }
 
-fn readHttpRequest(allocator: Allocator, reader: *Io.net.Stream.Reader) ![]u8 {
+const ConnectionReader = struct {
+    io: Io,
+    stream: Io.net.Stream,
+    buffer: []u8,
+    start: usize = 0,
+    end: usize = 0,
+
+    fn init(io: Io, stream: Io.net.Stream, buffer: []u8) ConnectionReader {
+        return .{
+            .io = io,
+            .stream = stream,
+            .buffer = buffer,
+        };
+    }
+
+    fn takeByte(self: *ConnectionReader, timeout: Io.Timeout) !u8 {
+        if (self.start >= self.end) {
+            const message = try self.stream.socket.receiveTimeout(self.io, self.buffer, timeout);
+            if (message.data.len == 0) return error.EndOfStream;
+            self.start = 0;
+            self.end = message.data.len;
+        }
+
+        const byte = self.buffer[self.start];
+        self.start += 1;
+        return byte;
+    }
+};
+
+fn keepAliveTimeout(config: Config) Io.Timeout {
+    return .{ .duration = .{
+        .raw = Io.Duration.fromMilliseconds(config.keep_alive_timeout_ms),
+        .clock = .awake,
+    } };
+}
+
+fn readHttpRequest(allocator: Allocator, reader: *ConnectionReader, timeout: Io.Timeout) ![]u8 {
     var data = try std.ArrayList(u8).initCapacity(allocator, 1024);
     errdefer data.deinit(allocator);
 
     while (data.items.len < max_request_bytes) {
-        const byte = reader.interface.takeByte() catch |err| switch (err) {
-            error.ReadFailed => return reader.err orelse err,
-            error.EndOfStream => return error.BadRequest,
-        };
+        const byte = try reader.takeByte(timeout);
         try data.append(allocator, byte);
-        if (std.mem.indexOf(u8, data.items, "\r\n\r\n") != null) {
+        if (data.items.len >= 4 and std.mem.eql(u8, data.items[data.items.len - 4 ..], "\r\n\r\n")) {
             return try data.toOwnedSlice(allocator);
         }
     }
@@ -1501,6 +1567,7 @@ fn servePath(
     request_target: []const u8,
     if_modified_since: ?[]const u8,
     is_head: bool,
+    connection: []const u8,
     config: Config,
 ) !ResponseResult {
     var file = root.openFile(io, relative_path, .{
@@ -1509,18 +1576,18 @@ fn servePath(
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
-            return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
+            return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection);
         },
         error.IsDir => {
             if (config.trailing_slash_redirect and !targetPathHasTrailingSlash(request_target)) {
-                return sendRedirect(allocator, out, stream_writer, request_target, is_head, config.headers);
+                return sendRedirect(allocator, out, stream_writer, request_target, is_head, connection, config.headers);
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, config);
+            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config);
         },
         error.AccessDenied => {
-            return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n");
+            return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
         },
         else => return err,
     };
@@ -1528,7 +1595,7 @@ fn servePath(
 
     const stat = try file.stat(io);
     if (stat.kind != .file) {
-        return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n");
+        return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection);
     }
 
     const content_type = mimeType(relative_path);
@@ -1543,7 +1610,7 @@ fn servePath(
                         .{ .code = 304, .reason = "Not Modified" },
                         content_type,
                         0,
-                        "close",
+                        connection,
                         null,
                         config.headers,
                         last_modified,
@@ -1556,7 +1623,7 @@ fn servePath(
         }
     }
 
-    try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, "close", null, config.headers, last_modified, null);
+    try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, connection, null, config.headers, last_modified, null);
     if (!is_head) {
         try streamFile(io, out, file);
     }
@@ -1577,8 +1644,8 @@ fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
     }
 }
 
-fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: ResponseStatus, body: []const u8) !ResponseResult {
-    try sendHeaders(out, status, "text/plain; charset=utf-8", body.len, "close", null, &.{}, null, null);
+fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: ResponseStatus, body: []const u8, connection: []const u8) !ResponseResult {
+    try sendHeaders(out, status, "text/plain; charset=utf-8", body.len, connection, null, &.{}, null, null);
     try out.writeAll(body);
     try stream_writer.interface.flush();
     return .{ .status = status.code, .bytes = body.len };
@@ -1590,6 +1657,7 @@ fn sendRedirect(
     stream_writer: *Io.net.Stream.Writer,
     request_target: []const u8,
     is_head: bool,
+    connection: []const u8,
     extra_headers: []const Header,
 ) !ResponseResult {
     const location = try slashRedirectLocation(allocator, request_target);
@@ -1601,7 +1669,7 @@ fn sendRedirect(
         .{ .code = 308, .reason = "Permanent Redirect" },
         "text/plain; charset=utf-8",
         body.len,
-        "close",
+        connection,
         null,
         extra_headers,
         null,
