@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.3
+
+- Bumped qaws version metadata, Docker tags, and documentation to 0.2.3.
+
 ### 0.2.2
 
 - Documented static cache defaults and HTTP connection tuning flags.

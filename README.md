@@ -13,7 +13,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 ## Status
 
-qaws is currently `0.2.2`.
+qaws is currently `0.2.3`.
 
 It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, bounded connection workers, static file serving, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
@@ -84,7 +84,7 @@ qaws version
 `qaws version` prints:
 
 ```text
-qaws 0.2.2
+qaws 0.2.3
 ```
 
 ## Serving Rules
@@ -168,7 +168,7 @@ Boolean flags are available as pairs when a config file may need to be overridde
 
 qaws caches small static files by default. The cache stores file bodies up to `256 KiB`, keeps at most `16 MiB` of active cached bodies, prebuilds common response headers, and revalidates cached files after `1000` ms. When the total cache limit is reached, additional files are served through the normal uncached path instead of evicting existing entries.
 
-Cache settings are JSON-only in `0.2.2`:
+Cache settings are JSON-only in `0.2.3`:
 
 ```json
 {
@@ -343,21 +343,21 @@ ghcr.io/nulldoubt/qaws
 Tags:
 
 ```text
-0.2.2
+0.2.3
 latest
 ```
 
 Run the sample image:
 
 ```sh
-docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.2
+docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.3
 curl -i http://127.0.0.1:8080/
 ```
 
 Run with your own static files:
 
 ```sh
-docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.2
+docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.3
 ```
 
 The container keeps the normal qaws defaults: it serves `./public` from `0.0.0.0:80`. The image uses `/` as its working directory and includes the sample `public/` directory, so it also works without a bind mount.
@@ -380,8 +380,8 @@ Publish both registries with Buildx:
 Inspect the published manifests:
 
 ```sh
-docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.2
-docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.2
+docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.3
+docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.3
 ```
 
 ## Release Builds
@@ -404,18 +404,18 @@ Current practical server targets:
 
 | Target | Artifact |
 | --- | --- |
-| `x86_64-linux-musl` | `dist/qaws-0.2.2-x86_64-linux-musl` |
-| `x86_64-linux-gnu` | `dist/qaws-0.2.2-x86_64-linux-gnu` |
-| `aarch64-linux-musl` | `dist/qaws-0.2.2-aarch64-linux-musl` |
-| `aarch64-linux-gnu` | `dist/qaws-0.2.2-aarch64-linux-gnu` |
-| `arm-linux-musleabihf` | `dist/qaws-0.2.2-arm-linux-musleabihf` |
-| `riscv64-linux-musl` | `dist/qaws-0.2.2-riscv64-linux-musl` |
-| `aarch64-linux-android` | `dist/qaws-0.2.2-aarch64-linux-android` |
-| `aarch64-macos` | `dist/qaws-0.2.2-aarch64-macos` |
-| `x86_64-macos` | `dist/qaws-0.2.2-x86_64-macos` |
-| `x86_64-windows-gnu` | `dist/qaws-0.2.2-x86_64-windows-gnu.exe` |
-| `aarch64-windows-gnu` | `dist/qaws-0.2.2-aarch64-windows-gnu.exe` |
-| `x86_64-freebsd` | `dist/qaws-0.2.2-x86_64-freebsd` |
+| `x86_64-linux-musl` | `dist/qaws-0.2.3-x86_64-linux-musl` |
+| `x86_64-linux-gnu` | `dist/qaws-0.2.3-x86_64-linux-gnu` |
+| `aarch64-linux-musl` | `dist/qaws-0.2.3-aarch64-linux-musl` |
+| `aarch64-linux-gnu` | `dist/qaws-0.2.3-aarch64-linux-gnu` |
+| `arm-linux-musleabihf` | `dist/qaws-0.2.3-arm-linux-musleabihf` |
+| `riscv64-linux-musl` | `dist/qaws-0.2.3-riscv64-linux-musl` |
+| `aarch64-linux-android` | `dist/qaws-0.2.3-aarch64-linux-android` |
+| `aarch64-macos` | `dist/qaws-0.2.3-aarch64-macos` |
+| `x86_64-macos` | `dist/qaws-0.2.3-x86_64-macos` |
+| `x86_64-windows-gnu` | `dist/qaws-0.2.3-x86_64-windows-gnu.exe` |
+| `aarch64-windows-gnu` | `dist/qaws-0.2.3-aarch64-windows-gnu.exe` |
+| `x86_64-freebsd` | `dist/qaws-0.2.3-x86_64-freebsd` |
 
 The release matrix intentionally excludes targets that are not practical qaws server artifacts, including WASI, iOS, tvOS, watchOS, UEFI, GPU, console, freestanding, and similar non-server environments.
 
