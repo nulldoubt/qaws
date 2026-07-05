@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.2
+
+- Bumped qaws version metadata, Docker tags, and documentation to 0.2.2.
+
 ### 0.2.1
 
 - Added Docker image packaging and a Buildx publish script for amd64/arm64 images.

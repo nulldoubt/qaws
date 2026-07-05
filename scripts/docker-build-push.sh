@@ -3,7 +3,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-VERSION="${QAWS_VERSION:-0.2.1}"
+VERSION="${QAWS_VERSION:-0.2.2}"
 PLATFORMS="${QAWS_PLATFORMS:-linux/amd64,linux/arm64}"
 
 docker buildx build \
