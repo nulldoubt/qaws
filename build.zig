@@ -44,7 +44,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .single_threaded = true,
         }),
     });
     const test_cmd = b.addRunArtifact(unit_tests);
@@ -83,7 +82,6 @@ fn addQawsExecutable(
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .single_threaded = true,
             .strip = optimize != .Debug,
         }),
         .version = .{ .major = 0, .minor = 2, .patch = 1 },

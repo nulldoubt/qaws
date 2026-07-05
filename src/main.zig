@@ -11,6 +11,7 @@ const max_request_bytes = 16 * 1024;
 const default_keep_alive_timeout_ms: u32 = 5000;
 const default_max_requests_per_connection: u32 = 1000;
 const default_max_connections: u32 = 128;
+const worker_stack_size = 512 * 1024;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
@@ -174,6 +175,15 @@ const AccessRecord = struct {
     user_agent: ?[]const u8,
 };
 
+const ConnectionContext = struct {
+    allocator: Allocator,
+    io: Io,
+    stream: Io.net.Stream,
+    config: Config,
+    logger: *Logger,
+    active_connections: *std.atomic.Value(u32),
+};
+
 const CliError = error{
     MissingValue,
     InvalidPort,
@@ -203,6 +213,7 @@ const Logger = struct {
     offset: u64 = 0,
     format: LogFormat,
     access_enabled: bool,
+    mutex: Io.Mutex = .init,
 
     fn init(allocator: Allocator, io: Io, config: Config) !Logger {
         if (config.log_file) |path| {
@@ -311,6 +322,9 @@ const Logger = struct {
     }
 
     fn writeLine(self: *Logger, line: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.owns_file) {
             try self.file.writePositionalAll(self.io, line, self.offset);
             self.offset += line.len;
@@ -431,7 +445,7 @@ fn runServeCommand(
     installShutdownHandlers();
     var logger = try Logger.init(allocator, io, config);
     defer logger.deinit();
-    try serve(allocator, config, &logger);
+    try serve(std.heap.smp_allocator, io, config, &logger);
 }
 
 fn loadArgs(allocator: Allocator, io: Io, init_args: std.process.Args) !LoadedArgs {
@@ -1127,14 +1141,12 @@ fn checkConfig(io: Io, config: Config) !void {
     try writer.flush();
 }
 
-fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var root = try Io.Dir.cwd().openDir(io, config.serve_dir, .{});
-    defer root.close(io);
-
+fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger) !void {
     var address = try IpAddress.parse(config.host, config.port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
+    var active_connections = std.atomic.Value(u32).init(0);
+    defer waitForConnections(io, &active_connections);
 
     try logger.event("info", "serving {s} on {s}:{d}", .{ config.serve_dir, config.host, config.port });
 
@@ -1146,12 +1158,91 @@ fn serve(allocator: Allocator, config: Config, logger: *Logger) !void {
                 return err;
             },
         };
-        handleConnection(allocator, io, root, stream, config, logger) catch |err| {
-            logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+        if (!tryAcquireConnection(&active_connections, config.max_connections)) {
+            sendBusy(io, stream) catch |err| {
+                logger.event("error", "busy response failed: {s}", .{@errorName(err)}) catch {};
+            };
+            continue;
+        }
+
+        const context = allocator.create(ConnectionContext) catch |err| {
+            releaseConnection(&active_connections);
+            logger.event("error", "connection allocation failed: {s}", .{@errorName(err)}) catch {};
+            sendBusy(io, stream) catch {};
+            continue;
         };
+        context.* = .{
+            .allocator = allocator,
+            .io = io,
+            .stream = stream,
+            .config = config,
+            .logger = logger,
+            .active_connections = &active_connections,
+        };
+
+        const thread = std.Thread.spawn(.{
+            .stack_size = worker_stack_size,
+            .allocator = allocator,
+        }, connectionWorker, .{context}) catch |err| {
+            allocator.destroy(context);
+            releaseConnection(&active_connections);
+            logger.event("error", "connection worker failed: {s}", .{@errorName(err)}) catch {};
+            sendBusy(io, stream) catch {};
+            continue;
+        };
+        thread.detach();
     }
 
     logger.event("info", "shutdown", .{}) catch {};
+}
+
+fn tryAcquireConnection(active_connections: *std.atomic.Value(u32), max_connections: u32) bool {
+    var current = active_connections.load(.seq_cst);
+    while (current < max_connections) {
+        if (active_connections.cmpxchgWeak(current, current + 1, .seq_cst, .seq_cst)) |actual| {
+            current = actual;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn releaseConnection(active_connections: *std.atomic.Value(u32)) void {
+    _ = active_connections.fetchSub(1, .seq_cst);
+}
+
+fn waitForConnections(io: Io, active_connections: *std.atomic.Value(u32)) void {
+    while (active_connections.load(.seq_cst) != 0) {
+        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+}
+
+fn connectionWorker(context: *ConnectionContext) void {
+    defer context.allocator.destroy(context);
+    defer releaseConnection(context.active_connections);
+
+    var root = Io.Dir.cwd().openDir(context.io, context.config.serve_dir, .{}) catch |err| {
+        context.stream.close(context.io);
+        context.logger.event("error", "serve directory failed: {s}", .{@errorName(err)}) catch {};
+        return;
+    };
+    defer root.close(context.io);
+
+    handleConnection(context.allocator, context.io, root, context.stream, context.config, context.logger) catch |err| {
+        context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+    };
+}
+
+fn sendBusy(io: Io, stream: Io.net.Stream) !void {
+    defer stream.close(io);
+    var writer_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &writer_buffer);
+    const out = &writer.interface;
+    const body = "Server busy\n";
+    try sendHeaders(out, .{ .code = 503, .reason = "Service Unavailable" }, "text/plain; charset=utf-8", body.len, "close", null, &.{}, null, null);
+    try out.writeAll(body);
+    try writer.interface.flush();
 }
 
 fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger) !void {
