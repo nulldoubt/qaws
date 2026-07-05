@@ -620,7 +620,7 @@ const Logger = struct {
     access_enabled: bool,
     queue: LogQueue,
     thread: ?std.Thread = null,
-    dropped_access: std.atomic.Value(u64) = .init(0),
+    dropped_access: std.atomic.Value(u32) = .init(0),
 
     fn init(allocator: Allocator, io: Io, config: Config) !Logger {
         if (config.log_file) |path| {
@@ -2696,7 +2696,7 @@ test "async access logger drops when queue is full" {
     };
     logger.access(record);
     logger.access(record);
-    try std.testing.expectEqual(@as(u64, 1), logger.dropped_access.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), logger.dropped_access.load(.monotonic));
 }
 
 test "connection accounting enforces configured cap" {

@@ -2,6 +2,7 @@
 
 ### 0.2.3
 
+- Kept async access-log drop accounting portable across 32-bit release targets.
 - Documented worker-pool defaults, async logging, pipelining behavior, and the next performance roadmap.
 - Added ordered HTTP/1.1 pipelining coverage for sequential keep-alive requests.
 - Added async log writing with non-blocking access-log drops under queue pressure.
