@@ -8,6 +8,9 @@ const IpAddress = Io.net.IpAddress;
 const version = "0.2.1";
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
+const default_keep_alive_timeout_ms: u32 = 5000;
+const default_max_requests_per_connection: u32 = 1000;
+const default_max_connections: u32 = 128;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
@@ -33,6 +36,10 @@ const Config = struct {
     dotfiles: DotfilePolicy = .deny_except_well_known,
     last_modified: bool = true,
     trailing_slash_redirect: bool = true,
+    keep_alive: bool = true,
+    keep_alive_timeout_ms: u32 = default_keep_alive_timeout_ms,
+    max_requests_per_connection: u32 = default_max_requests_per_connection,
+    max_connections: u32 = default_max_connections,
     headers: []const Header = &.{},
 };
 
@@ -77,6 +84,7 @@ const CliOptions = struct {
     log_file: ?[]const u8 = null,
     access_log: ?bool = null,
     pid_file: ?[]const u8 = null,
+    keep_alive: ?bool = null,
     force: bool = false,
 };
 
@@ -119,13 +127,31 @@ const SecurityConfig = struct {
 const HttpConfig = struct {
     last_modified: ?bool = null,
     trailing_slash_redirect: ?bool = null,
+    keep_alive: ?bool = null,
+    keep_alive_timeout_ms: ?u32 = null,
+    max_requests_per_connection: ?u32 = null,
+    max_connections: ?u32 = null,
+};
+
+const HttpVersion = enum {
+    http_1_0,
+    http_1_1,
+};
+
+const ConnectionDirective = enum {
+    none,
+    keep_alive,
+    close,
 };
 
 const Request = struct {
     method: []const u8,
     target: []const u8,
+    version: HttpVersion,
+    connection: ConnectionDirective = .none,
     user_agent: ?[]const u8 = null,
     if_modified_since: ?[]const u8 = null,
+    has_request_body: bool = false,
 };
 
 const ResponseStatus = struct {
@@ -537,6 +563,10 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
             cli.access_log = true;
         } else if (std.mem.eql(u8, arg, "--no-access-log")) {
             cli.access_log = false;
+        } else if (std.mem.eql(u8, arg, "--keep-alive")) {
+            cli.keep_alive = true;
+        } else if (std.mem.eql(u8, arg, "--no-keep-alive")) {
+            cli.keep_alive = false;
         } else if (std.mem.eql(u8, arg, "-d")) {
             cli.daemon = true;
         } else if (std.mem.eql(u8, arg, "check")) {
@@ -588,6 +618,7 @@ fn applyCliOverrides(config: *Config, cli: CliOptions) void {
     if (cli.log_file) |value| config.log_file = value;
     if (cli.access_log) |value| config.access_log = value;
     if (cli.pid_file) |value| config.pid_file = value;
+    if (cli.keep_alive) |value| config.keep_alive = value;
 }
 
 fn loadConfigFile(allocator: Allocator, io: Io, path: []const u8, config: *Config) !void {
@@ -632,6 +663,19 @@ fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Confi
     if (file_config.http) |http| {
         if (http.last_modified) |last_modified| config.last_modified = last_modified;
         if (http.trailing_slash_redirect) |trailing_slash_redirect| config.trailing_slash_redirect = trailing_slash_redirect;
+        if (http.keep_alive) |keep_alive| config.keep_alive = keep_alive;
+        if (http.keep_alive_timeout_ms) |timeout_ms| {
+            if (timeout_ms == 0) return error.InvalidHttpConfig;
+            config.keep_alive_timeout_ms = timeout_ms;
+        }
+        if (http.max_requests_per_connection) |max_requests| {
+            if (max_requests == 0) return error.InvalidHttpConfig;
+            config.max_requests_per_connection = max_requests;
+        }
+        if (http.max_connections) |max_connections| {
+            if (max_connections == 0) return error.InvalidHttpConfig;
+            config.max_connections = max_connections;
+        }
     }
 
     if (file_config.headers) |headers| {
@@ -1222,11 +1266,18 @@ fn parseRequest(bytes: []const u8) !Request {
     const target = parts.next() orelse return error.BadRequest;
     const version_text = parts.next() orelse return error.BadRequest;
     if (parts.next() != null) return error.BadRequest;
-    if (!std.mem.startsWith(u8, version_text, "HTTP/1.")) return error.BadRequest;
+    const version_value: HttpVersion = if (std.mem.eql(u8, version_text, "HTTP/1.1"))
+        .http_1_1
+    else if (std.mem.eql(u8, version_text, "HTTP/1.0"))
+        .http_1_0
+    else
+        return error.BadRequest;
     if (target.len == 0 or target[0] != '/') return error.BadRequest;
 
     var user_agent: ?[]const u8 = null;
     var if_modified_since: ?[]const u8 = null;
+    var connection: ConnectionDirective = .none;
+    var has_request_body = false;
     var header_start = line_end + 2;
     while (header_start < bytes.len) {
         const header_end_rel = std.mem.indexOf(u8, bytes[header_start..], "\r\n") orelse break;
@@ -1240,6 +1291,15 @@ fn parseRequest(bytes: []const u8) !Request {
                 user_agent = value;
             } else if (std.ascii.eqlIgnoreCase(name, "If-Modified-Since")) {
                 if_modified_since = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
+                connection = mergeConnectionDirective(connection, parseConnectionHeader(value));
+            } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+                const length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
+                if (length > 0) has_request_body = true;
+            } else if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) {
+                if (value.len != 0 and !std.ascii.eqlIgnoreCase(value, "identity")) {
+                    has_request_body = true;
+                }
             }
         }
         header_start = header_end + 2;
@@ -1248,8 +1308,38 @@ fn parseRequest(bytes: []const u8) !Request {
     return .{
         .method = method,
         .target = target,
+        .version = version_value,
+        .connection = connection,
         .user_agent = user_agent,
         .if_modified_since = if_modified_since,
+        .has_request_body = has_request_body,
+    };
+}
+
+fn parseConnectionHeader(value: []const u8) ConnectionDirective {
+    var result: ConnectionDirective = .none;
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, &std.ascii.whitespace);
+        if (std.ascii.eqlIgnoreCase(token, "close")) return .close;
+        if (std.ascii.eqlIgnoreCase(token, "keep-alive")) result = .keep_alive;
+    }
+    return result;
+}
+
+fn mergeConnectionDirective(current: ConnectionDirective, next: ConnectionDirective) ConnectionDirective {
+    if (current == .close or next == .close) return .close;
+    if (current == .keep_alive or next == .keep_alive) return .keep_alive;
+    return .none;
+}
+
+fn requestWantsKeepAlive(request: Request, config: Config, served_requests: u32) bool {
+    if (!config.keep_alive) return false;
+    if (served_requests >= config.max_requests_per_connection) return false;
+    if (request.connection == .close) return false;
+    return switch (request.version) {
+        .http_1_1 => true,
+        .http_1_0 => request.connection == .keep_alive,
     };
 }
 
@@ -1726,6 +1816,7 @@ test "parse cli serve options" {
         "--log-file",
         "qaws.log",
         "--no-access-log",
+        "--no-keep-alive",
         "-d",
     };
     const command = try parseArgs(args);
@@ -1737,6 +1828,7 @@ test "parse cli serve options" {
             try std.testing.expectEqual(LogFormat.jsonl, config.log_format);
             try std.testing.expectEqualStrings("qaws.log", config.log_file.?);
             try std.testing.expect(!config.access_log);
+            try std.testing.expect(!config.keep_alive);
             try std.testing.expect(config.daemon);
         },
         else => return error.TestExpectedEqual,
@@ -1777,7 +1869,14 @@ test "json config applies values and cli overrides" {
         \\  "logging": { "format": "jsonl", "access": false },
         \\  "security": { "dotfiles": "deny_all" },
         \\  "headers": { "Cache-Control": "public, max-age=60" },
-        \\  "http": { "last_modified": false, "trailing_slash_redirect": false }
+        \\  "http": {
+        \\    "last_modified": false,
+        \\    "trailing_slash_redirect": false,
+        \\    "keep_alive": false,
+        \\    "keep_alive_timeout_ms": 2000,
+        \\    "max_requests_per_connection": 100,
+        \\    "max_connections": 64
+        \\  }
         \\}
     ;
 
@@ -1803,17 +1902,23 @@ test "json config applies values and cli overrides" {
     try std.testing.expectEqual(DotfilePolicy.deny_all, config.dotfiles);
     try std.testing.expect(!config.last_modified);
     try std.testing.expect(!config.trailing_slash_redirect);
+    try std.testing.expect(!config.keep_alive);
+    try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
+    try std.testing.expectEqual(@as(u32, 64), config.max_connections);
 
     applyCliOverrides(&config, .{
         .host = "0.0.0.0",
         .port = 9090,
         .serve_dir = "public",
         .access_log = true,
+        .keep_alive = true,
     });
     try std.testing.expectEqualStrings("0.0.0.0", config.host);
     try std.testing.expectEqual(@as(u16, 9090), config.port);
     try std.testing.expectEqualStrings("public", config.serve_dir);
     try std.testing.expect(config.access_log);
+    try std.testing.expect(config.keep_alive);
 }
 
 test "json config rejects unknown keys and invalid headers" {
@@ -1838,6 +1943,49 @@ test "json config rejects unknown keys and invalid headers" {
     });
     defer protected.deinit();
     try std.testing.expectError(error.ProtectedHeader, applyFileConfig(allocator, protected.value, &config));
+}
+
+test "json config rejects invalid http limits" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(FileConfig, allocator, "{ \"http\": { \"keep_alive_timeout_ms\": 0 } }", .{
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+
+    var config = Config{};
+    try std.testing.expectError(error.InvalidHttpConfig, applyFileConfig(allocator, parsed.value, &config));
+}
+
+test "http keep-alive decisions follow protocol defaults" {
+    const http11 = try parseRequest("GET / HTTP/1.1\r\nHost: example\r\n\r\n");
+    try std.testing.expectEqual(HttpVersion.http_1_1, http11.version);
+    try std.testing.expect(requestWantsKeepAlive(http11, .{}, 1));
+
+    const http11_close = try parseRequest("GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    try std.testing.expectEqual(ConnectionDirective.close, http11_close.connection);
+    try std.testing.expect(!requestWantsKeepAlive(http11_close, .{}, 1));
+
+    const http10 = try parseRequest("GET / HTTP/1.0\r\n\r\n");
+    try std.testing.expectEqual(HttpVersion.http_1_0, http10.version);
+    try std.testing.expect(!requestWantsKeepAlive(http10, .{}, 1));
+
+    const http10_keep_alive = try parseRequest("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    try std.testing.expectEqual(ConnectionDirective.keep_alive, http10_keep_alive.connection);
+    try std.testing.expect(requestWantsKeepAlive(http10_keep_alive, .{}, 1));
+}
+
+test "connection header parsing is tokenized and close wins" {
+    const request = try parseRequest("GET / HTTP/1.1\r\nConnection: Upgrade, Keep-Alive\r\nConnection: close\r\n\r\n");
+    try std.testing.expectEqual(ConnectionDirective.close, request.connection);
+
+    const body = try parseRequest("GET / HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
+    try std.testing.expect(body.has_request_body);
+
+    const disabled = Config{ .keep_alive = false };
+    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\n\r\n"), disabled, 1));
+
+    const capped = Config{ .max_requests_per_connection = 1 };
+    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\n\r\n"), capped, 1));
 }
 
 test "http date parsing and slash redirect locations" {
