@@ -13,7 +13,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 ## Status
 
-qaws is currently `0.2.0`.
+qaws is currently `0.2.1`.
 
 It supports HTTP/1.1 `GET` and `HEAD`, serves static files, maps directory requests to `index.html`, rejects path traversal, logs requests by default, supports explicit JSON config, and can manage Unix-style daemons with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
@@ -80,7 +80,7 @@ qaws version
 `qaws version` prints:
 
 ```text
-qaws 0.2.0
+qaws 0.2.1
 ```
 
 ## Serving Rules
@@ -291,18 +291,18 @@ Current practical server targets:
 
 | Target | Artifact |
 | --- | --- |
-| `x86_64-linux-musl` | `dist/qaws-0.2.0-x86_64-linux-musl` |
-| `x86_64-linux-gnu` | `dist/qaws-0.2.0-x86_64-linux-gnu` |
-| `aarch64-linux-musl` | `dist/qaws-0.2.0-aarch64-linux-musl` |
-| `aarch64-linux-gnu` | `dist/qaws-0.2.0-aarch64-linux-gnu` |
-| `arm-linux-musleabihf` | `dist/qaws-0.2.0-arm-linux-musleabihf` |
-| `riscv64-linux-musl` | `dist/qaws-0.2.0-riscv64-linux-musl` |
-| `aarch64-linux-android` | `dist/qaws-0.2.0-aarch64-linux-android` |
-| `aarch64-macos` | `dist/qaws-0.2.0-aarch64-macos` |
-| `x86_64-macos` | `dist/qaws-0.2.0-x86_64-macos` |
-| `x86_64-windows-gnu` | `dist/qaws-0.2.0-x86_64-windows-gnu.exe` |
-| `aarch64-windows-gnu` | `dist/qaws-0.2.0-aarch64-windows-gnu.exe` |
-| `x86_64-freebsd` | `dist/qaws-0.2.0-x86_64-freebsd` |
+| `x86_64-linux-musl` | `dist/qaws-0.2.1-x86_64-linux-musl` |
+| `x86_64-linux-gnu` | `dist/qaws-0.2.1-x86_64-linux-gnu` |
+| `aarch64-linux-musl` | `dist/qaws-0.2.1-aarch64-linux-musl` |
+| `aarch64-linux-gnu` | `dist/qaws-0.2.1-aarch64-linux-gnu` |
+| `arm-linux-musleabihf` | `dist/qaws-0.2.1-arm-linux-musleabihf` |
+| `riscv64-linux-musl` | `dist/qaws-0.2.1-riscv64-linux-musl` |
+| `aarch64-linux-android` | `dist/qaws-0.2.1-aarch64-linux-android` |
+| `aarch64-macos` | `dist/qaws-0.2.1-aarch64-macos` |
+| `x86_64-macos` | `dist/qaws-0.2.1-x86_64-macos` |
+| `x86_64-windows-gnu` | `dist/qaws-0.2.1-x86_64-windows-gnu.exe` |
+| `aarch64-windows-gnu` | `dist/qaws-0.2.1-aarch64-windows-gnu.exe` |
+| `x86_64-freebsd` | `dist/qaws-0.2.1-x86_64-freebsd` |
 
 The release matrix intentionally excludes targets that are not practical qaws server artifacts, including WASI, iOS, tvOS, watchOS, UEFI, GPU, console, freestanding, and similar non-server environments.
 

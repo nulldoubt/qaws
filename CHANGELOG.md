@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.1
+
+- Bumped qaws version metadata and documentation to 0.2.1.
+
 ### 0.2.0
 
 - Updated release documentation and generated SHA256 checksums for release artifacts.
