@@ -2,6 +2,7 @@
 
 ### 0.2.3
 
+- Added ordered HTTP/1.1 pipelining coverage for sequential keep-alive requests.
 - Added async log writing with non-blocking access-log drops under queue pressure.
 - Replaced per-connection thread spawning with a bounded fixed worker pool.
 - Added worker-count CLI and JSON configuration with a higher default connection cap.

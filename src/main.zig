@@ -2570,6 +2570,62 @@ test "request chunk appender rejects oversized headers" {
     try std.testing.expectError(error.RequestTooLarge, appendRequestChunk(&buffer, &len, "123456789"));
 }
 
+test "request reader handles pipelined requests in order" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fake_stream = Io.net.Stream{
+        .socket = .{
+            .handle = -1,
+            .address = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        },
+    };
+    const pipelined = "GET /first HTTP/1.1\r\nHost: x\r\n\r\nHEAD /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    var reader_buffer: [pipelined.len]u8 = undefined;
+    @memcpy(&reader_buffer, pipelined);
+    var reader = ConnectionReader{
+        .io = io,
+        .stream = fake_stream,
+        .buffer = &reader_buffer,
+        .start = 0,
+        .end = reader_buffer.len,
+    };
+    var request_buffer: [max_request_bytes]u8 = undefined;
+
+    const first_bytes = try readHttpRequest(&reader, keepAliveTimeout(.{}), &request_buffer);
+    const first = try parseRequest(first_bytes);
+    try std.testing.expectEqualStrings("GET", first.method);
+    try std.testing.expectEqualStrings("/first", first.target);
+
+    const second_bytes = try readHttpRequest(&reader, keepAliveTimeout(.{}), &request_buffer);
+    const second = try parseRequest(second_bytes);
+    try std.testing.expectEqualStrings("HEAD", second.method);
+    try std.testing.expectEqualStrings("/second", second.target);
+    try std.testing.expectEqual(ConnectionDirective.close, second.connection);
+}
+
+test "pipelined malformed request is rejected after prior request" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fake_stream = Io.net.Stream{
+        .socket = .{
+            .handle = -1,
+            .address = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        },
+    };
+    const pipelined = "GET / HTTP/1.1\r\nHost: x\r\n\r\nBAD\r\n\r\n";
+    var reader_buffer: [pipelined.len]u8 = undefined;
+    @memcpy(&reader_buffer, pipelined);
+    var reader = ConnectionReader{
+        .io = io,
+        .stream = fake_stream,
+        .buffer = &reader_buffer,
+        .start = 0,
+        .end = reader_buffer.len,
+    };
+    var request_buffer: [max_request_bytes]u8 = undefined;
+
+    _ = try parseRequest(try readHttpRequest(&reader, keepAliveTimeout(.{}), &request_buffer));
+    try std.testing.expectError(error.BadRequest, parseRequest(try readHttpRequest(&reader, keepAliveTimeout(.{}), &request_buffer)));
+}
+
 test "worker count resolves explicit and automatic defaults" {
     try std.testing.expectEqual(@as(usize, 3), resolveWorkerCount(.{ .workers = 3 }));
     try std.testing.expect(resolveWorkerCount(.{}) >= 1);
