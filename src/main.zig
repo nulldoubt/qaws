@@ -206,6 +206,75 @@ const ConnectionContext = struct {
     active_connections: *std.atomic.Value(u32),
 };
 
+const WorkerContext = struct {
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    queue: *WorkerQueue,
+    active_connections: *std.atomic.Value(u32),
+};
+
+const WorkerQueue = struct {
+    allocator: Allocator,
+    io: Io,
+    buffer: []Io.net.Stream,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+    closed: bool = false,
+    mutex: Io.Mutex = .init,
+    condition: Io.Condition = .init,
+
+    fn init(allocator: Allocator, io: Io, capacity: usize) !WorkerQueue {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .buffer = try allocator.alloc(Io.net.Stream, capacity),
+        };
+    }
+
+    fn deinit(self: *WorkerQueue) void {
+        self.allocator.free(self.buffer);
+    }
+
+    fn push(self: *WorkerQueue, stream: Io.net.Stream) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.closed or self.count == self.buffer.len) return false;
+        self.buffer[self.tail] = stream;
+        self.tail = (self.tail + 1) % self.buffer.len;
+        self.count += 1;
+        self.condition.signal(self.io);
+        return true;
+    }
+
+    fn pop(self: *WorkerQueue) ?Io.net.Stream {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        while (self.count == 0 and !self.closed) {
+            self.condition.waitUncancelable(self.io, &self.mutex);
+        }
+        if (self.count == 0) return null;
+
+        const stream = self.buffer[self.head];
+        self.head = (self.head + 1) % self.buffer.len;
+        self.count -= 1;
+        return stream;
+    }
+
+    fn close(self: *WorkerQueue) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.closed = true;
+        self.condition.broadcast(self.io);
+    }
+};
+
 const CachedFile = struct {
     path: []u8,
     valid: bool,
@@ -1453,13 +1522,51 @@ fn checkConfig(io: Io, config: Config) !void {
 }
 
 fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *StaticCache) !void {
+    var root_check = try Io.Dir.cwd().openDir(io, config.serve_dir, .{});
+    root_check.close(io);
+
     var address = try IpAddress.parse(config.host, config.port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
-    var active_connections = std.atomic.Value(u32).init(0);
-    defer waitForConnections(io, &active_connections);
 
-    try logger.event("info", "serving {s} on {s}:{d}", .{ config.serve_dir, config.host, config.port });
+    const worker_count = resolveWorkerCount(config);
+    var queue = try WorkerQueue.init(allocator, io, @intCast(config.max_connections));
+    defer queue.deinit();
+
+    var active_connections = std.atomic.Value(u32).init(0);
+    var threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    const contexts = try allocator.alloc(WorkerContext, worker_count);
+    defer allocator.free(contexts);
+
+    var started_workers: usize = 0;
+    errdefer {
+        queue.close();
+        for (threads[0..started_workers]) |thread| thread.join();
+    }
+
+    for (contexts, 0..) |*context, index| {
+        context.* = .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .logger = logger,
+            .cache = cache,
+            .queue = &queue,
+            .active_connections = &active_connections,
+        };
+        threads[index] = try std.Thread.spawn(.{
+            .stack_size = worker_stack_size,
+            .allocator = allocator,
+        }, workerLoop, .{context});
+        started_workers += 1;
+    }
+    defer {
+        queue.close();
+        for (threads[0..started_workers]) |thread| thread.join();
+    }
+
+    try logger.event("info", "serving {s} on {s}:{d} with {d} workers", .{ config.serve_dir, config.host, config.port, worker_count });
 
     accept_loop: while (!shutdown_requested.load(.seq_cst)) {
         const stream = server.accept(io) catch |err| switch (err) {
@@ -1476,36 +1583,20 @@ fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *
             continue;
         }
 
-        const context = allocator.create(ConnectionContext) catch |err| {
+        if (!queue.push(stream)) {
             releaseConnection(&active_connections);
-            logger.event("error", "connection allocation failed: {s}", .{@errorName(err)}) catch {};
             sendBusy(io, stream) catch {};
             continue;
-        };
-        context.* = .{
-            .allocator = allocator,
-            .io = io,
-            .stream = stream,
-            .config = config,
-            .logger = logger,
-            .cache = cache,
-            .active_connections = &active_connections,
-        };
-
-        const thread = std.Thread.spawn(.{
-            .stack_size = worker_stack_size,
-            .allocator = allocator,
-        }, connectionWorker, .{context}) catch |err| {
-            allocator.destroy(context);
-            releaseConnection(&active_connections);
-            logger.event("error", "connection worker failed: {s}", .{@errorName(err)}) catch {};
-            sendBusy(io, stream) catch {};
-            continue;
-        };
-        thread.detach();
+        }
     }
 
     logger.event("info", "shutdown", .{}) catch {};
+}
+
+fn resolveWorkerCount(config: Config) usize {
+    if (config.workers > 0) return @intCast(config.workers);
+    const detected = std.Thread.getCpuCount() catch 1;
+    return @max(@as(usize, 1), detected);
 }
 
 fn tryAcquireConnection(active_connections: *std.atomic.Value(u32), max_connections: u32) bool {
@@ -1524,26 +1615,19 @@ fn releaseConnection(active_connections: *std.atomic.Value(u32)) void {
     _ = active_connections.fetchSub(1, .seq_cst);
 }
 
-fn waitForConnections(io: Io, active_connections: *std.atomic.Value(u32)) void {
-    while (active_connections.load(.seq_cst) != 0) {
-        Io.sleep(io, Io.Duration.fromMilliseconds(10), .awake) catch {};
-    }
-}
-
-fn connectionWorker(context: *ConnectionContext) void {
-    defer context.allocator.destroy(context);
-    defer releaseConnection(context.active_connections);
-
+fn workerLoop(context: *WorkerContext) void {
     var root = Io.Dir.cwd().openDir(context.io, context.config.serve_dir, .{}) catch |err| {
-        context.stream.close(context.io);
         context.logger.event("error", "serve directory failed: {s}", .{@errorName(err)}) catch {};
         return;
     };
     defer root.close(context.io);
 
-    handleConnection(context.allocator, context.io, root, context.stream, context.config, context.logger, context.cache) catch |err| {
-        context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
-    };
+    while (context.queue.pop()) |stream| {
+        handleConnection(context.allocator, context.io, root, stream, context.config, context.logger, context.cache) catch |err| {
+            context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+        };
+        releaseConnection(context.active_connections);
+    }
 }
 
 fn sendBusy(io: Io, stream: Io.net.Stream) !void {
@@ -2373,6 +2457,37 @@ test "request chunk appender rejects oversized headers" {
     var buffer: [8]u8 = undefined;
     var len: usize = 0;
     try std.testing.expectError(error.RequestTooLarge, appendRequestChunk(&buffer, &len, "123456789"));
+}
+
+test "worker count resolves explicit and automatic defaults" {
+    try std.testing.expectEqual(@as(usize, 3), resolveWorkerCount(.{ .workers = 3 }));
+    try std.testing.expect(resolveWorkerCount(.{}) >= 1);
+}
+
+test "worker queue push pop and close behavior" {
+    var queue = try WorkerQueue.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), 1);
+    defer queue.deinit();
+
+    const fake_stream = Io.net.Stream{
+        .socket = .{
+            .handle = -1,
+            .address = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        },
+    };
+    try std.testing.expect(queue.push(fake_stream));
+    try std.testing.expect(!queue.push(fake_stream));
+    try std.testing.expect(queue.pop() != null);
+    queue.close();
+    try std.testing.expect(!queue.push(fake_stream));
+    try std.testing.expect(queue.pop() == null);
+}
+
+test "connection accounting enforces configured cap" {
+    var active = std.atomic.Value(u32).init(0);
+    try std.testing.expect(tryAcquireConnection(&active, 1));
+    try std.testing.expect(!tryAcquireConnection(&active, 1));
+    releaseConnection(&active);
+    try std.testing.expectEqual(@as(u32, 0), active.load(.seq_cst));
 }
 
 test "normalize rejects traversal" {

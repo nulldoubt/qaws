@@ -2,6 +2,7 @@
 
 ### 0.2.3
 
+- Replaced per-connection thread spawning with a bounded fixed worker pool.
 - Added worker-count CLI and JSON configuration with a higher default connection cap.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.3.
 
