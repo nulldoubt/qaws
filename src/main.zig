@@ -1109,6 +1109,8 @@ fn printHelp() !void {
         \\  --log-format plain|jsonl
         \\  --log-file <path>
         \\  --pid-file <path>
+        \\  --keep-alive
+        \\  --no-keep-alive
         \\  --access-log
         \\  --no-access-log
         \\

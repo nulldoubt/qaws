@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.1`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, serves static files, maps directory requests to `index.html`, rejects path traversal, logs requests by default, supports explicit JSON config, and can manage Unix-style daemons with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, bounded connection workers, static file serving, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -40,6 +40,7 @@ Defaults:
 | `--config <path>` | none | Load strict JSON config. Config is never auto-discovered. |
 | `--log-format <format>` | `plain` | `plain` or `jsonl`. |
 | `--log-file <path>` | stderr, or derived in daemon mode | Log output path. |
+| `--keep-alive` / `--no-keep-alive` | keep-alive on | Enable or disable HTTP persistent connections. |
 | `--access-log` / `--no-access-log` | access logs on | Enable or disable per-request access logs. |
 | `--pid-file <path>` | derived in daemon mode | PID file for daemon start/status/stop/restart. |
 
@@ -92,6 +93,10 @@ qaws 0.2.1
 - `/docs` redirects to `/docs/` with `308 Permanent Redirect` when `docs/` is a directory.
 - Missing files return `404`.
 - Unsupported methods return `405` with `Allow: GET, HEAD`.
+- HTTP/1.1 keeps connections alive by default.
+- HTTP/1.0 closes by default unless the client sends `Connection: keep-alive`.
+- `Connection: close` always closes after the response.
+- Requests with bodies are rejected because qaws only serves static files.
 - Directory listings are never generated.
 - There is no SPA fallback. A missing route stays missing.
 - `..`, encoded traversal, NUL bytes, encoded slashes, and backslashes in request paths are rejected.
@@ -125,7 +130,14 @@ Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`
   "logging": { "format": "plain", "access": true },
   "security": { "dotfiles": "deny_except_well_known" },
   "headers": { "Cache-Control": "public, max-age=3600" },
-  "http": { "last_modified": true, "trailing_slash_redirect": true }
+  "http": {
+    "last_modified": true,
+    "trailing_slash_redirect": true,
+    "keep_alive": true,
+    "keep_alive_timeout_ms": 5000,
+    "max_requests_per_connection": 1000,
+    "max_connections": 128
+  }
 }
 ```
 
@@ -140,6 +152,20 @@ Validate config and the serve directory:
 ```sh
 qaws check --config qaws.json
 ```
+
+Boolean flags are available as pairs when a config file may need to be overridden from the command line. For example, `--no-access-log` disables the default access log, while `--access-log` re-enables it when a config file sets `"access": false`. The same pattern applies to `--keep-alive` and `--no-keep-alive`.
+
+## Keep-Alive And Concurrency
+
+qaws uses persistent HTTP connections by default:
+
+- Keep-alive is enabled unless `--no-keep-alive` or `"keep_alive": false` is set.
+- Idle keep-alive connections time out after `5000` ms by default.
+- A single connection is recycled after `1000` requests by default.
+- The server accepts up to `128` concurrent connection workers by default.
+- When the connection cap is reached, qaws returns `503 Service Unavailable` with `Connection: close`.
+
+These defaults are intentionally conservative enough for Termux and small VPS use, while still avoiding the heavy connection churn seen in one-request-per-connection benchmarks.
 
 ## Logging
 
@@ -333,6 +359,32 @@ Expected results:
 - Missing paths return `404`.
 - Traversal attempts return `403`.
 - Access logs appear by default.
+- HTTP/1.1 responses include `Connection: keep-alive` by default.
+
+## Benchmarking
+
+For local performance checks, disable access logs and raise the file descriptor limit first:
+
+```sh
+ulimit -n 65536
+./zig-out/bin/qaws --host 127.0.0.1 --port 18086 --serve ./public --no-access-log
+```
+
+Then run the same matrix when comparing builds:
+
+```sh
+wrk -t1 -c1 -d30s http://127.0.0.1:18086/
+wrk -t1 -c10 -d30s http://127.0.0.1:18086/
+wrk -t8 -c25 -d30s http://127.0.0.1:18086/
+wrk -t8 -c100 -d30s http://127.0.0.1:18086/
+```
+
+To compare old one-request-per-connection behavior, disable keep-alive:
+
+```sh
+./zig-out/bin/qaws --host 127.0.0.1 --port 18086 --serve ./public --no-access-log --no-keep-alive
+wrk -t8 -c100 -d30s http://127.0.0.1:18086/
+```
 
 ## Troubleshooting
 
