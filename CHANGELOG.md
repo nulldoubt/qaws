@@ -2,6 +2,7 @@
 
 ### 0.2.1
 
+- Added Docker image packaging and a Buildx publish script for amd64/arm64 images.
 - Documented keep-alive defaults, CLI override pairs, and local benchmark commands.
 - Added bounded per-connection worker threads and thread-safe logging.
 - Added HTTP keep-alive response handling with defensive close behavior for bad requests.

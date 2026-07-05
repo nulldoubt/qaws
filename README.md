@@ -297,6 +297,61 @@ zig build -Dtarget=aarch64-linux-android -Doptimize=ReleaseFast --prefix zig-out
 
 The normal install output is `zig-out/bin/qaws` unless `--prefix` is changed.
 
+## Docker Images
+
+qaws publishes multi-architecture Docker images for `linux/amd64` and `linux/arm64`.
+
+Registries:
+
+```text
+code.alkhatib.online/alkhatib/qaws
+ghcr.io/nulldoubt/qaws
+```
+
+Tags:
+
+```text
+0.2.1
+latest
+```
+
+Run the sample image:
+
+```sh
+docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.1
+curl -i http://127.0.0.1:8080/
+```
+
+Run with your own static files:
+
+```sh
+docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.1
+```
+
+The container keeps the normal qaws defaults: it serves `./public` from `0.0.0.0:80`. The image uses `/` as its working directory and includes the sample `public/` directory, so it also works without a bind mount.
+
+Log in before publishing:
+
+```sh
+docker login code.alkhatib.online
+echo "$GHCR_TOKEN" | docker login ghcr.io -u nulldoubt --password-stdin
+```
+
+`GHCR_TOKEN` needs permission to write packages for `ghcr.io/nulldoubt/qaws`.
+
+Publish both registries with Buildx:
+
+```sh
+./scripts/docker-build-push.sh
+```
+
+Inspect the published manifests:
+
+```sh
+docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.1
+docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.1
+```
+
 ## Release Builds
 
 The repeatable release command is:
