@@ -1404,6 +1404,9 @@ fn printHelp() !void {
         \\  --pid-file <path>
         \\  --keep-alive
         \\  --no-keep-alive
+        \\  --keep-alive-timeout-ms <n>
+        \\  --max-requests-per-connection <n>
+        \\  --max-connections <n>
         \\  --access-log
         \\  --no-access-log
         \\

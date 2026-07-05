@@ -2,6 +2,7 @@
 
 ### 0.2.2
 
+- Documented static cache defaults and HTTP connection tuning flags.
 - Added a small-file static cache with prebuilt response headers and TTL revalidation.
 - Removed per-request request-buffer allocation and added fast normalization for simple safe paths.
 - Added strict JSON cache settings and CLI overrides for HTTP connection limits.

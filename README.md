@@ -41,6 +41,9 @@ Defaults:
 | `--log-format <format>` | `plain` | `plain` or `jsonl`. |
 | `--log-file <path>` | stderr, or derived in daemon mode | Log output path. |
 | `--keep-alive` / `--no-keep-alive` | keep-alive on | Enable or disable HTTP persistent connections. |
+| `--keep-alive-timeout-ms <n>` | `5000` | Idle timeout for persistent connections. |
+| `--max-requests-per-connection <n>` | `1000` | Maximum requests before recycling one persistent connection. |
+| `--max-connections <n>` | `128` | Maximum concurrent connection workers. |
 | `--access-log` / `--no-access-log` | access logs on | Enable or disable per-request access logs. |
 | `--pid-file <path>` | derived in daemon mode | PID file for daemon start/status/stop/restart. |
 
@@ -129,6 +132,12 @@ Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`
   "daemon": { "enabled": false, "pid_file": null, "log_file": null },
   "logging": { "format": "plain", "access": true },
   "security": { "dotfiles": "deny_except_well_known" },
+  "cache": {
+    "enabled": true,
+    "max_file_bytes": 262144,
+    "max_total_bytes": 16777216,
+    "revalidate_ms": 1000
+  },
   "headers": { "Cache-Control": "public, max-age=3600" },
   "http": {
     "last_modified": true,
@@ -154,6 +163,29 @@ qaws check --config qaws.json
 ```
 
 Boolean flags are available as pairs when a config file may need to be overridden from the command line. For example, `--no-access-log` disables the default access log, while `--access-log` re-enables it when a config file sets `"access": false`. The same pattern applies to `--keep-alive` and `--no-keep-alive`.
+
+## Static Cache
+
+qaws caches small static files by default. The cache stores file bodies up to `256 KiB`, keeps at most `16 MiB` of active cached bodies, prebuilds common response headers, and revalidates cached files after `1000` ms. When the total cache limit is reached, additional files are served through the normal uncached path instead of evicting existing entries.
+
+Cache settings are JSON-only in `0.2.2`:
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "max_file_bytes": 262144,
+    "max_total_bytes": 16777216,
+    "revalidate_ms": 1000
+  }
+}
+```
+
+Disable the cache for comparisons or development checks:
+
+```json
+{ "cache": { "enabled": false } }
+```
 
 ## Keep-Alive And Concurrency
 
@@ -439,6 +471,12 @@ To compare old one-request-per-connection behavior, disable keep-alive:
 ```sh
 ./zig-out/bin/qaws --host 127.0.0.1 --port 18086 --serve ./public --no-access-log --no-keep-alive
 wrk -t8 -c100 -d30s http://127.0.0.1:18086/
+```
+
+To compare cached and uncached static serving, run once with the default cache and once with:
+
+```json
+{ "cache": { "enabled": false } }
 ```
 
 ## Troubleshooting
