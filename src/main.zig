@@ -18,6 +18,7 @@ const worker_stack_size = 512 * 1024;
 const log_queue_capacity = 4096;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
+var sendfile_fallback_logged = std.atomic.Value(bool).init(false);
 
 const LogFormat = enum {
     plain,
@@ -188,6 +189,18 @@ const ResponseStatus = struct {
 const ResponseResult = struct {
     status: u16,
     bytes: u64,
+};
+
+const FileTransferPath = enum {
+    none,
+    buffered,
+    sendfile,
+};
+
+const SendfileResult = union(enum) {
+    sent: u64,
+    fallback: anyerror,
+    partial_error: anyerror,
 };
 
 const AccessRecord = struct {
@@ -1861,6 +1874,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             allocator,
             io,
             root,
+            stream,
             out,
             &writer,
             relative_path,
@@ -1869,6 +1883,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             is_head,
             response_connection,
             config,
+            logger,
             cache,
         );
         access_record.status = result.status;
@@ -2231,6 +2246,7 @@ fn servePath(
     allocator: Allocator,
     io: Io,
     root: Io.Dir,
+    stream: Io.net.Stream,
     out: *Io.Writer,
     stream_writer: *Io.net.Stream.Writer,
     relative_path: []const u8,
@@ -2239,6 +2255,7 @@ fn servePath(
     is_head: bool,
     connection: []const u8,
     config: Config,
+    logger: *Logger,
     cache: *StaticCache,
 ) !ResponseResult {
     if (try cache.tryServe(io, root, out, stream_writer, relative_path, if_modified_since, is_head, connection)) |result| {
@@ -2259,7 +2276,7 @@ fn servePath(
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config, cache);
+            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config, logger, cache);
         },
         error.AccessDenied => {
             return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
@@ -2300,7 +2317,7 @@ fn servePath(
 
     try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, connection, null, config.headers, last_modified, null);
     if (!is_head) {
-        try streamFile(io, out, file);
+        try sendFileBody(io, stream, out, stream_writer, file, stat.size, config, logger);
     }
     try stream_writer.interface.flush();
     return .{ .status = 200, .bytes = if (is_head) 0 else stat.size };
@@ -2317,6 +2334,137 @@ fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
         if (n == 0) break;
         try out.writeAll(file_buffer[0..n]);
     }
+}
+
+fn selectFileTransferPath(config: Config, is_head: bool, cache_served: bool) FileTransferPath {
+    if (cache_served or is_head) return .none;
+    if (config.sendfile and sendfileSupportedForOs(builtin.os.tag)) return .sendfile;
+    return .buffered;
+}
+
+fn sendfileSupportedForOs(os_tag: std.Target.Os.Tag) bool {
+    return switch (os_tag) {
+        .linux, .macos, .freebsd => true,
+        else => false,
+    };
+}
+
+fn sendFileBody(
+    io: Io,
+    stream: Io.net.Stream,
+    out: *Io.Writer,
+    stream_writer: *Io.net.Stream.Writer,
+    file: Io.File,
+    size: u64,
+    config: Config,
+    logger: *Logger,
+) !void {
+    if (selectFileTransferPath(config, false, false) != .sendfile) {
+        try streamFile(io, out, file);
+        return;
+    }
+
+    try stream_writer.interface.flush();
+    switch (trySendfile(stream, file, size)) {
+        .sent => return,
+        .fallback => |err| {
+            logSendfileFallback(logger, err);
+            try streamFile(io, out, file);
+        },
+        .partial_error => |err| return err,
+    }
+}
+
+fn logSendfileFallback(logger: *Logger, err: anyerror) void {
+    if (sendfile_fallback_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
+        logger.event("warn", "sendfile unavailable; falling back to buffered streaming: {s}", .{@errorName(err)}) catch {};
+    }
+}
+
+fn trySendfile(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
+    if (size == 0) return .{ .sent = 0 };
+    return switch (builtin.os.tag) {
+        .linux => trySendfileLinux(stream, file, size),
+        .macos => trySendfileDarwin(stream, file, size),
+        .freebsd => trySendfileFreebsd(stream, file, size),
+        else => .{ .fallback = error.SendfileUnsupported },
+    };
+}
+
+fn fallbackOrPartial(sent: u64, err: anyerror) SendfileResult {
+    if (sent == 0) return .{ .fallback = err };
+    return .{ .partial_error = err };
+}
+
+fn trySendfileLinux(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
+    var offset: i64 = 0;
+    var sent: u64 = 0;
+    var remaining = size;
+    while (remaining != 0) {
+        const chunk = @min(remaining, @as(u64, 1 << 30));
+        const rc = std.os.linux.sendfile(stream.socket.handle, file.handle, &offset, @intCast(chunk));
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                const n: u64 = @intCast(rc);
+                if (n == 0) break;
+                sent += n;
+                remaining -= n;
+            },
+            .INTR => continue,
+            .AGAIN => return fallbackOrPartial(sent, error.SendfileWouldBlock),
+            .INVAL, .NOSYS, .OPNOTSUPP, .NOTSOCK => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            else => return fallbackOrPartial(sent, error.SendfileFailed),
+        }
+    }
+    return .{ .sent = sent };
+}
+
+fn trySendfileDarwin(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
+    var offset: std.c.off_t = 0;
+    var sent: u64 = 0;
+    var remaining = size;
+    while (remaining != 0) {
+        const chunk = @min(remaining, @as(u64, @intCast(std.math.maxInt(i32))));
+        var len: std.c.off_t = @intCast(chunk);
+        const rc = std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0);
+        const transferred: u64 = if (len > 0) @intCast(len) else 0;
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => if (transferred == 0) continue,
+            .AGAIN => if (transferred == 0) return fallbackOrPartial(sent, error.SendfileWouldBlock),
+            .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            else => return fallbackOrPartial(sent, error.SendfileFailed),
+        }
+        if (transferred == 0) break;
+        sent += transferred;
+        remaining -= transferred;
+        offset += @intCast(transferred);
+    }
+    return .{ .sent = sent };
+}
+
+fn trySendfileFreebsd(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
+    var offset: std.c.off_t = 0;
+    var sent: u64 = 0;
+    var remaining = size;
+    while (remaining != 0) {
+        const chunk = @min(remaining, @as(u64, std.math.maxInt(usize)));
+        var sbytes: std.c.off_t = 0;
+        const rc = std.c.sendfile(file.handle, stream.socket.handle, offset, @intCast(chunk), null, &sbytes, 0);
+        const transferred: u64 = if (sbytes > 0) @intCast(sbytes) else 0;
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .BUSY => if (transferred == 0) continue,
+            .AGAIN => if (transferred == 0) return fallbackOrPartial(sent, error.SendfileWouldBlock),
+            .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            else => return fallbackOrPartial(sent, error.SendfileFailed),
+        }
+        if (transferred == 0) break;
+        sent += transferred;
+        remaining -= transferred;
+        offset += @intCast(transferred);
+    }
+    return .{ .sent = sent };
 }
 
 fn readFileBody(io: Io, file: Io.File, body: []u8) !void {
@@ -2851,6 +2999,18 @@ test "prebuilt cached headers preserve response fields" {
     try std.testing.expect(std.mem.indexOf(u8, header, "Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "Cache-Control: public, max-age=60\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, header, "\r\n\r\n"));
+}
+
+test "file transfer path selects sendfile only for uncached GET bodies" {
+    try std.testing.expectEqual(FileTransferPath.none, selectFileTransferPath(.{}, true, false));
+    try std.testing.expectEqual(FileTransferPath.none, selectFileTransferPath(.{}, false, true));
+    try std.testing.expectEqual(FileTransferPath.buffered, selectFileTransferPath(.{ .sendfile = false }, false, false));
+    const expected: FileTransferPath = if (sendfileSupportedForOs(builtin.os.tag)) .sendfile else .buffered;
+    try std.testing.expectEqual(expected, selectFileTransferPath(.{}, false, false));
+    try std.testing.expect(sendfileSupportedForOs(.linux));
+    try std.testing.expect(sendfileSupportedForOs(.macos));
+    try std.testing.expect(sendfileSupportedForOs(.freebsd));
+    try std.testing.expect(!sendfileSupportedForOs(.windows));
 }
 
 test "json config applies values and cli overrides" {
