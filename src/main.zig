@@ -470,15 +470,18 @@ const CachedFile = struct {
     header_200_close: []u8,
     header_304_keep_alive: []u8,
     header_304_close: []u8,
+    response_200_keep_alive: []u8,
     revalidate_after_ns: i96,
 
     fn snapshot(self: CachedFile, connection: []const u8) CachedFileSnapshot {
+        const keep_alive = std.mem.eql(u8, connection, "keep-alive");
         return .{
             .body = self.body,
             .size = self.size,
             .mtime_sec = self.mtime_sec,
-            .header_200 = cachedHeaderFor(connection, self.header_200_keep_alive, self.header_200_close),
-            .header_304 = cachedHeaderFor(connection, self.header_304_keep_alive, self.header_304_close),
+            .header_200 = if (keep_alive) self.header_200_keep_alive else self.header_200_close,
+            .header_304 = if (keep_alive) self.header_304_keep_alive else self.header_304_close,
+            .response_200 = if (keep_alive) self.response_200_keep_alive else &.{},
         };
     }
 };
@@ -489,6 +492,7 @@ const CachedFileSnapshot = struct {
     mtime_sec: i64,
     header_200: []const u8,
     header_304: []const u8,
+    response_200: []const u8,
 };
 
 const StaticCache = struct {
@@ -526,6 +530,7 @@ const StaticCache = struct {
             self.allocator.free(entry.header_200_close);
             self.allocator.free(entry.header_304_keep_alive);
             self.allocator.free(entry.header_304_close);
+            self.allocator.free(entry.response_200_keep_alive);
         }
         for (self.retired.items) |bytes| {
             if (bytes.len != 0) self.allocator.free(bytes);
@@ -655,6 +660,8 @@ const StaticCache = struct {
         errdefer self.allocator.free(header_304_keep_alive);
         const header_304_close = try buildHeaderAlloc(self.allocator, .{ .code = 304, .reason = "Not Modified" }, content_type, 0, "close", null, self.headers, last_modified, null);
         errdefer self.allocator.free(header_304_close);
+        const response_200_keep_alive = try concatAlloc(self.allocator, header_200_keep_alive, body);
+        errdefer self.allocator.free(response_200_keep_alive);
 
         const path = try self.allocator.dupe(u8, relative_path);
         errdefer self.allocator.free(path);
@@ -672,6 +679,7 @@ const StaticCache = struct {
             .header_200_close = header_200_close,
             .header_304_keep_alive = header_304_keep_alive,
             .header_304_close = header_304_close,
+            .response_200_keep_alive = response_200_keep_alive,
             .revalidate_after_ns = self.nextRevalidate(now).nanoseconds,
         };
     }
@@ -683,6 +691,7 @@ const StaticCache = struct {
         self.retire(entry.header_200_close);
         self.retire(entry.header_304_keep_alive);
         self.retire(entry.header_304_close);
+        self.retire(entry.response_200_keep_alive);
         self.total_body_bytes -= @intCast(entry.body.len);
 
         const old_path = entry.path;
@@ -702,6 +711,7 @@ const StaticCache = struct {
         self.allocator.free(entry.header_200_close);
         self.allocator.free(entry.header_304_keep_alive);
         self.allocator.free(entry.header_304_close);
+        self.allocator.free(entry.response_200_keep_alive);
     }
 
     fn retire(self: *StaticCache, bytes: []u8) void {
@@ -743,9 +753,16 @@ fn cachedEventResponseFromSnapshot(
     return .{
         .status = 200,
         .bytes = if (is_head) 0 else cached.size,
-        .header = cached.header_200,
-        .body = if (is_head) &.{} else cached.body,
+        .header = if (!is_head and cached.response_200.len != 0) cached.response_200 else cached.header_200,
+        .body = if (is_head or cached.response_200.len != 0) &.{} else cached.body,
     };
+}
+
+fn concatAlloc(allocator: Allocator, first: []const u8, second: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, first.len + second.len);
+    @memcpy(output[0..first.len], first);
+    @memcpy(output[first.len..], second);
+    return output;
 }
 
 const CliError = error{
@@ -4004,13 +4021,14 @@ test "cached event response selection handles GET HEAD and 304" {
         .mtime_sec = 0,
         .header_200 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n",
         .header_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n",
+        .response_200 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\nBismillah.",
     };
 
     const get = cachedEventResponseFromSnapshot(true, cached, null, false);
     try std.testing.expectEqual(@as(u16, 200), get.status);
     try std.testing.expectEqual(@as(u64, 10), get.bytes);
-    try std.testing.expectEqualStrings(cached.header_200, get.header);
-    try std.testing.expectEqualStrings(cached.body, get.body);
+    try std.testing.expectEqualStrings(cached.response_200, get.header);
+    try std.testing.expectEqual(@as(usize, 0), get.body.len);
 
     const head = cachedEventResponseFromSnapshot(true, cached, null, true);
     try std.testing.expectEqual(@as(u16, 200), head.status);
