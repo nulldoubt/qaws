@@ -2,6 +2,7 @@
 
 ### 0.2.4
 
+- Documented sendfile defaults, fallback behavior, and large-file benchmark commands.
 - Added platform sendfile transfer for uncached static `GET` bodies with buffered fallback.
 - Added `--sendfile`/`--no-sendfile` and strict JSON `http.sendfile` configuration.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.4.

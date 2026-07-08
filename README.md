@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.4`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, a fixed worker pool, async log writing, static file serving, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, a fixed worker pool, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -41,6 +41,7 @@ Defaults:
 | `--log-format <format>` | `plain` | `plain` or `jsonl`. |
 | `--log-file <path>` | stderr, or derived in daemon mode | Log output path. |
 | `--keep-alive` / `--no-keep-alive` | keep-alive on | Enable or disable HTTP persistent connections. |
+| `--sendfile` / `--no-sendfile` | sendfile on | Enable or disable platform sendfile for uncached static `GET` bodies. |
 | `--keep-alive-timeout-ms <n>` | `5000` | Idle timeout for persistent connections. |
 | `--max-requests-per-connection <n>` | `1000` | Maximum requests before recycling one persistent connection. |
 | `--max-connections <n>` | `1024` | Maximum active plus queued connections. |
@@ -145,6 +146,7 @@ Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`
     "last_modified": true,
     "trailing_slash_redirect": true,
     "keep_alive": true,
+    "sendfile": true,
     "keep_alive_timeout_ms": 5000,
     "max_requests_per_connection": 1000,
     "max_connections": 1024,
@@ -203,6 +205,24 @@ qaws uses persistent HTTP connections by default:
 - HTTP/1.1 pipelined requests on one connection are served sequentially in request order.
 
 These defaults stay usable on Termux and small VPS machines while avoiding per-connection thread creation overhead.
+
+## Sendfile
+
+qaws uses platform sendfile by default for uncached regular-file `GET` responses on supported Unix targets. Headers are still written through the normal response writer, then qaws flushes those headers and sends the file body through the platform file-transfer path. Cached small files keep using the in-memory cache, and `HEAD`, `304`, redirects, and errors do not use sendfile.
+
+Disable sendfile for comparison or troubleshooting:
+
+```sh
+qaws --no-sendfile --port 8080
+```
+
+Or in JSON:
+
+```json
+{ "http": { "sendfile": false } }
+```
+
+Unsupported platforms and early sendfile failures fall back to the normal buffered streaming path.
 
 ## Logging
 
@@ -484,9 +504,18 @@ To compare cached and uncached static serving, run once with the default cache a
 { "cache": { "enabled": false } }
 ```
 
+To compare sendfile with buffered streaming for larger files, use files outside the small-file cache limit and run the same benchmark once normally and once with `--no-sendfile`:
+
+```sh
+truncate -s 1m public/one-mib.bin
+truncate -s 64m public/sixty-four-mib.bin
+wrk -t4 -c16 -d30s http://127.0.0.1:18086/one-mib.bin
+wrk -t4 -c16 -d30s http://127.0.0.1:18086/sixty-four-mib.bin
+```
+
 ## Roadmap
 
-The next performance releases are expected to focus on platform file-transfer paths such as `sendfile` on macOS/BSD/Linux, then event-loop backends such as epoll and kqueue/kevent. Later cache work may add eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
+The next performance releases are expected to focus on event-loop backends such as epoll and kqueue/kevent. Later cache work may add eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
 
 ## Troubleshooting
 
