@@ -203,6 +203,12 @@ const SendfileResult = union(enum) {
     partial_error: anyerror,
 };
 
+const RuntimeBackend = enum {
+    worker,
+    epoll,
+    kqueue,
+};
+
 const AccessRecord = struct {
     remote: []const u8,
     method: []const u8,
@@ -231,6 +237,42 @@ const WorkerContext = struct {
     cache: *StaticCache,
     queue: *WorkerQueue,
     active_connections: *std.atomic.Value(u32),
+};
+
+const EventWorkerContext = struct {
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    queue: *WorkerQueue,
+    active_connections: *std.atomic.Value(u32),
+    backend: RuntimeBackend,
+    wake_read_fd: std.posix.fd_t,
+    wake_write_fd: std.posix.fd_t,
+};
+
+const EventConnection = struct {
+    stream: Io.net.Stream,
+    remote_buffer: [128]u8 = undefined,
+    remote_len: usize = 0,
+    request_buffer: [max_request_bytes]u8 = undefined,
+    request_len: usize = 0,
+    served_requests: u32 = 0,
+    last_active: Io.Timestamp,
+
+    fn remote(self: *const EventConnection) []const u8 {
+        return self.remote_buffer[0..self.remote_len];
+    }
+};
+
+const WakePipe = struct {
+    read: std.posix.fd_t,
+    write: std.posix.fd_t,
+};
+
+const ProcessRequestResult = struct {
+    keep_open: bool,
 };
 
 const WorkerQueue = struct {
@@ -277,6 +319,17 @@ const WorkerQueue = struct {
         }
         if (self.count == 0) return null;
 
+        const stream = self.buffer[self.head];
+        self.head = (self.head + 1) % self.buffer.len;
+        self.count -= 1;
+        return stream;
+    }
+
+    fn popAvailable(self: *WorkerQueue) ?Io.net.Stream {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.count == 0) return null;
         const stream = self.buffer[self.head];
         self.head = (self.head + 1) % self.buffer.len;
         self.count -= 1;
@@ -1664,6 +1717,38 @@ fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    const backend = comptime selectRuntimeBackend(builtin.os.tag);
+    return switch (backend) {
+        .worker => serveBlockingWorkers(allocator, io, config, logger, cache, &server, backend),
+        .epoll, .kqueue => serveEventWorkers(allocator, io, config, logger, cache, &server, backend),
+    };
+}
+
+fn selectRuntimeBackend(os_tag: std.Target.Os.Tag) RuntimeBackend {
+    return switch (os_tag) {
+        .linux => .epoll,
+        .macos, .freebsd => .kqueue,
+        else => .worker,
+    };
+}
+
+fn runtimeBackendName(backend: RuntimeBackend) []const u8 {
+    return switch (backend) {
+        .worker => "worker",
+        .epoll => "epoll",
+        .kqueue => "kqueue",
+    };
+}
+
+fn serveBlockingWorkers(
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    server: *Io.net.Server,
+    backend: RuntimeBackend,
+) !void {
     const worker_count = resolveWorkerCount(config);
     var queue = try WorkerQueue.init(allocator, io, @intCast(config.max_connections));
     defer queue.deinit();
@@ -1701,7 +1786,7 @@ fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *
         for (threads[0..started_workers]) |thread| thread.join();
     }
 
-    try logger.event("info", "serving {s} on {s}:{d} with {d} workers", .{ config.serve_dir, config.host, config.port, worker_count });
+    try logger.event("info", "serving {s} on {s}:{d} with {d} workers using {s}", .{ config.serve_dir, config.host, config.port, worker_count, runtimeBackendName(backend) });
 
     accept_loop: while (!shutdown_requested.load(.seq_cst)) {
         const stream = server.accept(io) catch |err| switch (err) {
@@ -1723,6 +1808,109 @@ fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cache: *
             sendBusy(io, stream) catch {};
             continue;
         }
+    }
+
+    logger.event("info", "shutdown", .{}) catch {};
+}
+
+fn serveEventWorkers(
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    server: *Io.net.Server,
+    backend: RuntimeBackend,
+) !void {
+    const worker_count = resolveWorkerCount(config);
+    var queues = try allocator.alloc(WorkerQueue, worker_count);
+    defer allocator.free(queues);
+    var pipes = try allocator.alloc(WakePipe, worker_count);
+    defer allocator.free(pipes);
+    var threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    const contexts = try allocator.alloc(EventWorkerContext, worker_count);
+    defer allocator.free(contexts);
+
+    var active_connections = std.atomic.Value(u32).init(0);
+    var started_queues: usize = 0;
+    var started_pipes: usize = 0;
+    var started_workers: usize = 0;
+    errdefer {
+        for (queues[0..started_queues]) |*queue| queue.close();
+        for (pipes[0..started_pipes]) |pipe| wakeFd(pipe.write) catch {};
+        for (threads[0..started_workers]) |thread| thread.join();
+        for (pipes[0..started_pipes]) |pipe| closeWakePipe(pipe);
+        for (queues[0..started_queues]) |*queue| queue.deinit();
+    }
+
+    for (contexts, 0..) |*context, index| {
+        queues[index] = try WorkerQueue.init(allocator, io, @intCast(config.max_connections));
+        started_queues += 1;
+        pipes[index] = try createWakePipe();
+        started_pipes += 1;
+        context.* = .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .logger = logger,
+            .cache = cache,
+            .queue = &queues[index],
+            .active_connections = &active_connections,
+            .backend = backend,
+            .wake_read_fd = pipes[index].read,
+            .wake_write_fd = pipes[index].write,
+        };
+        threads[index] = try std.Thread.spawn(.{
+            .stack_size = worker_stack_size,
+            .allocator = allocator,
+        }, eventWorkerLoop, .{context});
+        started_workers += 1;
+    }
+    defer {
+        for (queues[0..started_queues]) |*queue| queue.close();
+        for (pipes[0..started_pipes]) |pipe| wakeFd(pipe.write) catch {};
+        for (threads[0..started_workers]) |thread| thread.join();
+        for (pipes[0..started_pipes]) |pipe| closeWakePipe(pipe);
+        for (queues[0..started_queues]) |*queue| queue.deinit();
+    }
+
+    try logger.event("info", "serving {s} on {s}:{d} with {d} workers using {s}", .{ config.serve_dir, config.host, config.port, worker_count, runtimeBackendName(backend) });
+
+    var next_worker: usize = 0;
+    accept_loop: while (!shutdown_requested.load(.seq_cst)) {
+        const stream = server.accept(io) catch |err| switch (err) {
+            error.ConnectionAborted => continue,
+            else => {
+                if (shutdown_requested.load(.seq_cst)) break :accept_loop;
+                return err;
+            },
+        };
+        if (!tryAcquireConnection(&active_connections, config.max_connections)) {
+            sendBusy(io, stream) catch |err| {
+                logger.event("error", "busy response failed: {s}", .{@errorName(err)}) catch {};
+            };
+            continue;
+        }
+
+        setFdNonblocking(stream.socket.handle, true) catch |err| {
+            releaseConnection(&active_connections);
+            logger.event("error", "failed to make socket nonblocking: {s}", .{@errorName(err)}) catch {};
+            stream.close(io);
+            continue;
+        };
+
+        const worker_index = next_worker;
+        next_worker = (next_worker + 1) % worker_count;
+        if (!queues[worker_index].push(stream)) {
+            releaseConnection(&active_connections);
+            setFdNonblocking(stream.socket.handle, false) catch {};
+            sendBusy(io, stream) catch {};
+            continue;
+        }
+        wakeFd(pipes[worker_index].write) catch |err| {
+            logger.event("error", "event worker wake failed: {s}", .{@errorName(err)}) catch {};
+        };
     }
 
     logger.event("info", "shutdown", .{}) catch {};
@@ -1762,6 +1950,513 @@ fn workerLoop(context: *WorkerContext) void {
             context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
         };
         releaseConnection(context.active_connections);
+    }
+}
+
+fn eventWorkerLoop(context: *EventWorkerContext) void {
+    var root = Io.Dir.cwd().openDir(context.io, context.config.serve_dir, .{}) catch |err| {
+        context.logger.event("error", "serve directory failed: {s}", .{@errorName(err)}) catch {};
+        return;
+    };
+    defer root.close(context.io);
+
+    switch (comptime selectRuntimeBackend(builtin.os.tag)) {
+        .epoll => eventWorkerLoopEpoll(context, root) catch |err| {
+            context.logger.event("error", "epoll worker failed: {s}", .{@errorName(err)}) catch {};
+        },
+        .kqueue => eventWorkerLoopKqueue(context, root) catch |err| {
+            context.logger.event("error", "kqueue worker failed: {s}", .{@errorName(err)}) catch {};
+        },
+        .worker => unreachable,
+    }
+}
+
+fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
+    const epoll_fd = try epollCreate();
+    defer closeFd(epoll_fd);
+
+    try epollAdd(epoll_fd, context.wake_read_fd);
+
+    var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
+    defer {
+        closeAllEventConnections(context, &connections);
+        connections.deinit();
+    }
+
+    var events: [128]std.os.linux.epoll_event = undefined;
+    while (!shutdown_requested.load(.seq_cst)) {
+        const count = try epollWait(epoll_fd, &events, eventWaitTimeoutMs(context.config));
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const event = events[index];
+            const fd = event.data.fd;
+            if (fd == context.wake_read_fd) {
+                drainWakeFd(context.wake_read_fd);
+                try registerQueuedEpoll(context, epoll_fd, &connections);
+                continue;
+            }
+            if ((event.events & (std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP)) != 0) {
+                closeEventConnection(context, &connections, fd);
+                continue;
+            }
+            if (connections.get(fd)) |conn| {
+                const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                    context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                    break :blk false;
+                };
+                if (!keep_open) closeEventConnection(context, &connections, fd);
+            }
+        }
+        try registerQueuedEpoll(context, epoll_fd, &connections);
+        closeExpiredEventConnections(context, &connections);
+    }
+}
+
+fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
+    const kq_fd = try kqueueCreate();
+    defer closeFd(kq_fd);
+
+    try kqueueAdd(kq_fd, context.wake_read_fd);
+
+    var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
+    defer {
+        closeAllEventConnections(context, &connections);
+        connections.deinit();
+    }
+
+    var events: [128]std.posix.Kevent = undefined;
+    while (!shutdown_requested.load(.seq_cst)) {
+        const count = try kqueueWait(kq_fd, &events, eventWaitTimeoutMs(context.config));
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const event = events[index];
+            const fd: std.posix.fd_t = @intCast(event.udata);
+            if (fd == context.wake_read_fd) {
+                drainWakeFd(context.wake_read_fd);
+                try registerQueuedKqueue(context, kq_fd, &connections);
+                continue;
+            }
+            if ((event.flags & std.c.EV.ERROR) != 0) {
+                closeEventConnection(context, &connections, fd);
+                continue;
+            }
+            if (connections.get(fd)) |conn| {
+                const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                    context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                    break :blk false;
+                };
+                if (!keep_open) closeEventConnection(context, &connections, fd);
+            }
+        }
+        try registerQueuedKqueue(context, kq_fd, &connections);
+        closeExpiredEventConnections(context, &connections);
+    }
+}
+
+fn registerQueuedEpoll(
+    context: *EventWorkerContext,
+    epoll_fd: std.posix.fd_t,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) !void {
+    while (context.queue.popAvailable()) |stream| {
+        const fd = stream.socket.handle;
+        const conn = createEventConnection(context, stream) catch |err| {
+            context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
+            stream.close(context.io);
+            releaseConnection(context.active_connections);
+            continue;
+        };
+        connections.put(fd, conn) catch |err| {
+            destroyEventConnection(context, conn);
+            return err;
+        };
+        epollAdd(epoll_fd, fd) catch |err| {
+            closeEventConnection(context, connections, fd);
+            context.logger.event("error", "epoll registration failed: {s}", .{@errorName(err)}) catch {};
+            continue;
+        };
+    }
+}
+
+fn registerQueuedKqueue(
+    context: *EventWorkerContext,
+    kq_fd: std.posix.fd_t,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) !void {
+    while (context.queue.popAvailable()) |stream| {
+        const fd = stream.socket.handle;
+        const conn = createEventConnection(context, stream) catch |err| {
+            context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
+            stream.close(context.io);
+            releaseConnection(context.active_connections);
+            continue;
+        };
+        connections.put(fd, conn) catch |err| {
+            destroyEventConnection(context, conn);
+            return err;
+        };
+        kqueueAdd(kq_fd, fd) catch |err| {
+            closeEventConnection(context, connections, fd);
+            context.logger.event("error", "kqueue registration failed: {s}", .{@errorName(err)}) catch {};
+            continue;
+        };
+    }
+}
+
+fn createEventConnection(context: *EventWorkerContext, stream: Io.net.Stream) !*EventConnection {
+    const conn = try context.allocator.create(EventConnection);
+    conn.* = .{
+        .stream = stream,
+        .last_active = Io.Timestamp.now(context.io, .awake),
+    };
+    const remote = formatRemoteAddress(stream.socket.address, &conn.remote_buffer);
+    conn.remote_len = remote.len;
+    return conn;
+}
+
+fn destroyEventConnection(context: *EventWorkerContext, conn: *EventConnection) void {
+    conn.stream.close(context.io);
+    releaseConnection(context.active_connections);
+    context.allocator.destroy(conn);
+}
+
+fn closeEventConnection(
+    context: *EventWorkerContext,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    fd: std.posix.fd_t,
+) void {
+    if (connections.fetchRemove(fd)) |entry| {
+        destroyEventConnection(context, entry.value);
+    }
+}
+
+fn closeAllEventConnections(
+    context: *EventWorkerContext,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) void {
+    var values = connections.valueIterator();
+    while (values.next()) |conn| {
+        destroyEventConnection(context, conn.*);
+    }
+    connections.clearRetainingCapacity();
+}
+
+fn closeExpiredEventConnections(
+    context: *EventWorkerContext,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) void {
+    const now = Io.Timestamp.now(context.io, .awake);
+    while (true) {
+        var expired: ?std.posix.fd_t = null;
+        var iterator = connections.iterator();
+        while (iterator.next()) |entry| {
+            if (eventConnectionExpired(entry.value_ptr.*, now, context.config)) {
+                expired = entry.key_ptr.*;
+                break;
+            }
+        }
+        closeEventConnection(context, connections, expired orelse return);
+    }
+}
+
+fn eventConnectionExpired(conn: *const EventConnection, now: Io.Timestamp, config: Config) bool {
+    const idle_ms = conn.last_active.durationTo(now).toMilliseconds();
+    return idle_ms >= config.keep_alive_timeout_ms;
+}
+
+fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *EventConnection) !bool {
+    while (true) {
+        if (conn.request_len == conn.request_buffer.len) {
+            if (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n") == null) {
+                try sendEventRequestError(context, root, conn, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n");
+                return false;
+            }
+            break;
+        }
+        const n = readFd(conn.stream.socket.handle, conn.request_buffer[conn.request_len..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            error.ConnectionResetByPeer, error.SocketUnconnected => return false,
+            else => return err,
+        };
+        if (n == 0) return false;
+        conn.request_len += n;
+        conn.last_active = Io.Timestamp.now(context.io, .awake);
+    }
+
+    while (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n")) |header_end_rel| {
+        if (shutdown_requested.load(.seq_cst)) return false;
+        const request_end = header_end_rel + 4;
+        const request_bytes = conn.request_buffer[0..request_end];
+        const request = parseRequest(request_bytes) catch {
+            try sendEventRequestError(context, root, conn, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n");
+            return false;
+        };
+
+        const current_request_count = conn.served_requests + 1;
+        try setFdNonblocking(conn.stream.socket.handle, false);
+        var writer_buffer: [8192]u8 = undefined;
+        var writer = conn.stream.writer(context.io, &writer_buffer);
+        const out = &writer.interface;
+        const result = try processParsedRequest(
+            context.allocator,
+            context.io,
+            root,
+            conn.stream,
+            out,
+            &writer,
+            request,
+            conn.remote(),
+            context.config,
+            context.logger,
+            context.cache,
+            current_request_count,
+            Io.Timestamp.now(context.io, .awake),
+        );
+
+        const remaining = conn.request_len - request_end;
+        if (remaining != 0) {
+            std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[request_end..conn.request_len]);
+        }
+        conn.request_len = remaining;
+        conn.served_requests = current_request_count;
+        conn.last_active = Io.Timestamp.now(context.io, .awake);
+
+        if (!result.keep_open) return false;
+        try setFdNonblocking(conn.stream.socket.handle, true);
+    }
+
+    if (conn.request_len == conn.request_buffer.len) {
+        try sendEventRequestError(context, root, conn, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n");
+        return false;
+    }
+    return true;
+}
+
+fn sendEventRequestError(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    conn: *EventConnection,
+    status: ResponseStatus,
+    body: []const u8,
+) !void {
+    _ = root;
+    try setFdNonblocking(conn.stream.socket.handle, false);
+    var writer_buffer: [1024]u8 = undefined;
+    var writer = conn.stream.writer(context.io, &writer_buffer);
+    try sendRequestError(
+        context.io,
+        context.logger,
+        &writer.interface,
+        &writer,
+        conn.remote(),
+        status,
+        body,
+        Io.Timestamp.now(context.io, .awake),
+    );
+}
+
+fn eventWaitTimeoutMs(config: Config) i32 {
+    return @intCast(@min(config.keep_alive_timeout_ms, @as(u32, 1000)));
+}
+
+fn createWakePipe() !WakePipe {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            var fds: [2]i32 = undefined;
+            const rc = std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true });
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => break :blk .{ .read = fds[0], .write = fds[1] },
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                else => return error.Unexpected,
+            }
+        },
+        else => blk: {
+            var fds: [2]std.c.fd_t = undefined;
+            if (std.c.pipe(&fds) != 0) return error.Unexpected;
+            errdefer {
+                closeFd(fds[0]);
+                closeFd(fds[1]);
+            }
+            try setFdNonblocking(fds[0], true);
+            try setFdNonblocking(fds[1], true);
+            try setFdCloseOnExec(fds[0]);
+            try setFdCloseOnExec(fds[1]);
+            break :blk .{ .read = fds[0], .write = fds[1] };
+        },
+    };
+}
+
+fn closeWakePipe(pipe: WakePipe) void {
+    closeFd(pipe.read);
+    closeFd(pipe.write);
+}
+
+fn wakeFd(fd: std.posix.fd_t) !void {
+    const byte: [1]u8 = .{1};
+    _ = writeFd(fd, &byte) catch |err| switch (err) {
+        error.WouldBlock => return,
+        else => return err,
+    };
+}
+
+fn drainWakeFd(fd: std.posix.fd_t) void {
+    var buffer: [64]u8 = undefined;
+    while (true) {
+        const n = readFd(fd, &buffer) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return,
+        };
+        if (n == 0 or n < buffer.len) return;
+    }
+}
+
+fn readFd(fd: std.posix.fd_t, buffer: []u8) !usize {
+    return std.posix.read(fd, buffer);
+}
+
+fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    if (bytes.len == 0) return 0;
+    return switch (builtin.os.tag) {
+        .linux => while (true) {
+            const rc = std.os.linux.write(fd, bytes.ptr, bytes.len);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.Unexpected,
+                .PIPE => return error.BrokenPipe,
+                else => return error.Unexpected,
+            }
+        },
+        else => while (true) {
+            const rc = std.c.write(fd, bytes.ptr, bytes.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.Unexpected,
+                .PIPE => return error.BrokenPipe,
+                else => return error.Unexpected,
+            }
+        },
+    };
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.close(fd),
+        else => _ = std.c.close(fd),
+    }
+}
+
+fn setFdNonblocking(fd: std.posix.fd_t, enabled: bool) !void {
+    const get_rc = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    switch (std.posix.errno(get_rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+    var flags: std.posix.O = @bitCast(@as(u32, @intCast(get_rc)));
+    flags.NONBLOCK = enabled;
+    const flag_bits: u32 = @bitCast(flags);
+    const set_rc = std.posix.system.fcntl(fd, std.posix.F.SETFL, @as(usize, flag_bits));
+    switch (std.posix.errno(set_rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn setFdCloseOnExec(fd: std.posix.fd_t) !void {
+    const get_rc = std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0));
+    switch (std.posix.errno(get_rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+    const flags = @as(usize, @intCast(get_rc)) | std.posix.FD_CLOEXEC;
+    const set_rc = std.posix.system.fcntl(fd, std.posix.F.SETFD, flags);
+    switch (std.posix.errno(set_rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn epollCreate() !std.posix.fd_t {
+    const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+}
+
+fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
+    var event = std.os.linux.epoll_event{
+        .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP,
+        .data = .{ .fd = fd },
+    };
+    const rc = std.os.linux.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn epollWait(epoll_fd: std.posix.fd_t, events: []std.os.linux.epoll_event, timeout_ms: i32) !usize {
+    while (true) {
+        const rc = std.os.linux.epoll_wait(epoll_fd, events.ptr, @intCast(events.len), timeout_ms);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn kqueueCreate() !std.posix.fd_t {
+    while (true) {
+        const rc = std.posix.system.kqueue();
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn kqueueAdd(kq_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
+    var changes = [_]std.posix.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.READ,
+        .flags = std.c.EV.ADD | std.c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = @intCast(fd),
+    }};
+    var ignored: [1]std.posix.Kevent = undefined;
+    const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .INTR => return kqueueAdd(kq_fd, fd),
+        else => return error.Unexpected,
+    }
+}
+
+fn kqueueWait(kq_fd: std.posix.fd_t, events: []std.posix.Kevent, timeout_ms: i32) !usize {
+    var timeout = std.posix.timespec{
+        .sec = @divTrunc(timeout_ms, 1000),
+        .nsec = @intCast(@mod(timeout_ms, 1000) * std.time.ns_per_ms),
+    };
+    while (true) {
+        const rc = std.posix.system.kevent(kq_fd, undefined, 0, events.ptr, @intCast(events.len), &timeout);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => return error.Unexpected,
+        }
     }
 }
 
@@ -1827,72 +2522,134 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
             finishAccessLog(logger, io, start, &access_record);
             return;
         };
-        access_record.method = request.method;
-        access_record.target = request.target;
-        access_record.user_agent = request.user_agent;
-
         const current_request_count = served_requests + 1;
-        var keep_open = requestWantsKeepAlive(request, config, current_request_count);
-        const response_connection = if (keep_open) "keep-alive" else "close";
-
-        if (request.has_request_body) {
-            const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
-            access_record.status = result.status;
-            access_record.bytes = result.bytes;
-            finishAccessLog(logger, io, start, &access_record);
-            return;
-        }
-
-        const is_head = std.mem.eql(u8, request.method, "HEAD");
-        if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
-            keep_open = false;
-            try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
-            try out.writeAll("Method not allowed\n");
-            try writer.interface.flush();
-            access_record.status = 405;
-            access_record.bytes = 19;
-            finishAccessLog(logger, io, start, &access_record);
-            return;
-        }
-
-        var relative_path_owned: ?[]u8 = null;
-        defer if (relative_path_owned) |path| allocator.free(path);
-        const relative_path = normalizeTargetFast(request.target, config.dotfiles) orelse blk: {
-            relative_path_owned = normalizeTarget(allocator, request.target, config.dotfiles) catch {
-                const result = try sendSimple(out, &writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
-                access_record.status = result.status;
-                access_record.bytes = result.bytes;
-                finishAccessLog(logger, io, start, &access_record);
-                if (!keep_open) return;
-                served_requests = current_request_count;
-                continue;
-            };
-            break :blk relative_path_owned.?;
-        };
-
-        const result = try servePath(
+        const result = try processParsedRequest(
             allocator,
             io,
             root,
             stream,
             out,
             &writer,
-            relative_path,
-            request.target,
-            request.if_modified_since,
-            is_head,
-            response_connection,
+            request,
+            remote,
             config,
             logger,
             cache,
+            current_request_count,
+            start,
         );
+
+        served_requests = current_request_count;
+        if (!result.keep_open) return;
+    }
+}
+
+fn processParsedRequest(
+    allocator: Allocator,
+    io: Io,
+    root: Io.Dir,
+    stream: Io.net.Stream,
+    out: *Io.Writer,
+    stream_writer: *Io.net.Stream.Writer,
+    request: Request,
+    remote: []const u8,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    current_request_count: u32,
+    start: Io.Timestamp,
+) !ProcessRequestResult {
+    var access_record = AccessRecord{
+        .remote = remote,
+        .method = request.method,
+        .target = request.target,
+        .status = 500,
+        .bytes = 0,
+        .duration_us = 0,
+        .user_agent = request.user_agent,
+    };
+
+    var keep_open = requestWantsKeepAlive(request, config, current_request_count);
+    const response_connection = if (keep_open) "keep-alive" else "close";
+
+    if (request.has_request_body) {
+        const result = try sendSimple(out, stream_writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
         access_record.status = result.status;
         access_record.bytes = result.bytes;
         finishAccessLog(logger, io, start, &access_record);
-
-        served_requests = current_request_count;
-        if (!keep_open) return;
+        return .{ .keep_open = false };
     }
+
+    const is_head = std.mem.eql(u8, request.method, "HEAD");
+    if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
+        keep_open = false;
+        try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
+        try out.writeAll("Method not allowed\n");
+        try stream_writer.interface.flush();
+        access_record.status = 405;
+        access_record.bytes = 19;
+        finishAccessLog(logger, io, start, &access_record);
+        return .{ .keep_open = false };
+    }
+
+    var relative_path_owned: ?[]u8 = null;
+    defer if (relative_path_owned) |path| allocator.free(path);
+    const relative_path = normalizeTargetFast(request.target, config.dotfiles) orelse blk: {
+        relative_path_owned = normalizeTarget(allocator, request.target, config.dotfiles) catch {
+            const result = try sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
+            access_record.status = result.status;
+            access_record.bytes = result.bytes;
+            finishAccessLog(logger, io, start, &access_record);
+            return .{ .keep_open = keep_open };
+        };
+        break :blk relative_path_owned.?;
+    };
+
+    const result = try servePath(
+        allocator,
+        io,
+        root,
+        stream,
+        out,
+        stream_writer,
+        relative_path,
+        request.target,
+        request.if_modified_since,
+        is_head,
+        response_connection,
+        config,
+        logger,
+        cache,
+    );
+    access_record.status = result.status;
+    access_record.bytes = result.bytes;
+    finishAccessLog(logger, io, start, &access_record);
+    return .{ .keep_open = keep_open };
+}
+
+fn sendRequestError(
+    io: Io,
+    logger: *Logger,
+    out: *Io.Writer,
+    stream_writer: *Io.net.Stream.Writer,
+    remote: []const u8,
+    status: ResponseStatus,
+    body: []const u8,
+    start: Io.Timestamp,
+) !void {
+    var access_record = AccessRecord{
+        .remote = remote,
+        .method = "-",
+        .target = "-",
+        .status = status.code,
+        .bytes = 0,
+        .duration_us = 0,
+        .user_agent = null,
+    };
+    const result = try sendSimple(out, stream_writer, status, body, "close");
+    access_record.status = result.status;
+    access_record.bytes = result.bytes;
+    finishAccessLog(logger, io, start, &access_record);
 }
 
 fn finishAccessLog(logger: *Logger, io: Io, start: Io.Timestamp, record: *AccessRecord) void {
@@ -2790,6 +3547,16 @@ test "worker count resolves explicit and automatic defaults" {
     try std.testing.expect(resolveWorkerCount(.{}) >= 1);
 }
 
+test "runtime backend selection follows supported platforms" {
+    try std.testing.expectEqual(RuntimeBackend.epoll, selectRuntimeBackend(.linux));
+    try std.testing.expectEqual(RuntimeBackend.kqueue, selectRuntimeBackend(.macos));
+    try std.testing.expectEqual(RuntimeBackend.kqueue, selectRuntimeBackend(.freebsd));
+    try std.testing.expectEqual(RuntimeBackend.worker, selectRuntimeBackend(.windows));
+    try std.testing.expectEqualStrings("epoll", runtimeBackendName(.epoll));
+    try std.testing.expectEqualStrings("kqueue", runtimeBackendName(.kqueue));
+    try std.testing.expectEqualStrings("worker", runtimeBackendName(.worker));
+}
+
 test "worker queue push pop and close behavior" {
     var queue = try WorkerQueue.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), 1);
     defer queue.deinit();
@@ -2802,10 +3569,47 @@ test "worker queue push pop and close behavior" {
     };
     try std.testing.expect(queue.push(fake_stream));
     try std.testing.expect(!queue.push(fake_stream));
+    try std.testing.expect(queue.popAvailable() != null);
+    try std.testing.expect(queue.popAvailable() == null);
+    try std.testing.expect(queue.push(fake_stream));
     try std.testing.expect(queue.pop() != null);
     queue.close();
     try std.testing.expect(!queue.push(fake_stream));
     try std.testing.expect(queue.pop() == null);
+}
+
+test "wake pipe supports event worker notifications" {
+    if (selectRuntimeBackend(builtin.os.tag) == .worker) return;
+
+    const pipe = try createWakePipe();
+    defer closeWakePipe(pipe);
+
+    try wakeFd(pipe.write);
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try readFd(pipe.read, &buffer));
+
+    try wakeFd(pipe.write);
+    drainWakeFd(pipe.read);
+    try std.testing.expectError(error.WouldBlock, readFd(pipe.read, &buffer));
+}
+
+test "event backend timeout helpers cap wait and detect fresh connections" {
+    try std.testing.expectEqual(@as(i32, 1000), eventWaitTimeoutMs(.{ .keep_alive_timeout_ms = 5000 }));
+    try std.testing.expectEqual(@as(i32, 25), eventWaitTimeoutMs(.{ .keep_alive_timeout_ms = 25 }));
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const now = Io.Timestamp.now(io, .awake);
+    const fake_stream = Io.net.Stream{
+        .socket = .{
+            .handle = -1,
+            .address = .{ .ip4 = Io.net.Ip4Address.loopback(0) },
+        },
+    };
+    const conn = EventConnection{
+        .stream = fake_stream,
+        .last_active = now,
+    };
+    try std.testing.expect(!eventConnectionExpired(&conn, now, .{ .keep_alive_timeout_ms = 1 }));
 }
 
 test "log queue preserves events and reports full access queue" {
