@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 
-const version = "0.2.5";
+const version = "0.2.6";
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 const default_keep_alive_timeout_ms: u32 = 5000;

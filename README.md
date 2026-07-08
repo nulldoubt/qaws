@@ -13,7 +13,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 ## Status
 
-qaws is currently `0.2.5`.
+qaws is currently `0.2.6`.
 
 It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
@@ -86,7 +86,7 @@ qaws version
 `qaws version` prints:
 
 ```text
-qaws 0.2.5
+qaws 0.2.6
 ```
 
 ## Serving Rules
@@ -173,7 +173,7 @@ Boolean flags are available as pairs when a config file may need to be overridde
 
 qaws caches small static files by default. The cache stores file bodies up to `256 KiB`, keeps at most `16 MiB` of active cached bodies, prebuilds common response headers, and revalidates cached files after `1000` ms. When the total cache limit is reached, additional files are served through the normal uncached path instead of evicting existing entries.
 
-Cache settings are JSON-only in `0.2.5`:
+Cache settings are JSON-only in `0.2.6`:
 
 ```json
 {
@@ -371,21 +371,21 @@ ghcr.io/nulldoubt/qaws
 Tags:
 
 ```text
-0.2.5
+0.2.6
 latest
 ```
 
 Run the sample image:
 
 ```sh
-docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.5
+docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.6
 curl -i http://127.0.0.1:8080/
 ```
 
 Run with your own static files:
 
 ```sh
-docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.5
+docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.6
 ```
 
 The container keeps the normal qaws defaults: it serves `./public` from `0.0.0.0:80`. The image uses `/` as its working directory and includes the sample `public/` directory, so it also works without a bind mount.
@@ -408,8 +408,8 @@ Publish both registries with Buildx:
 Inspect the published manifests:
 
 ```sh
-docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.5
-docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.5
+docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.6
+docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.6
 ```
 
 ## Release Builds
@@ -432,18 +432,18 @@ Current practical server targets:
 
 | Target | Artifact |
 | --- | --- |
-| `x86_64-linux-musl` | `dist/qaws-0.2.5-x86_64-linux-musl` |
-| `x86_64-linux-gnu` | `dist/qaws-0.2.5-x86_64-linux-gnu` |
-| `aarch64-linux-musl` | `dist/qaws-0.2.5-aarch64-linux-musl` |
-| `aarch64-linux-gnu` | `dist/qaws-0.2.5-aarch64-linux-gnu` |
-| `arm-linux-musleabihf` | `dist/qaws-0.2.5-arm-linux-musleabihf` |
-| `riscv64-linux-musl` | `dist/qaws-0.2.5-riscv64-linux-musl` |
-| `aarch64-linux-android` | `dist/qaws-0.2.5-aarch64-linux-android` |
-| `aarch64-macos` | `dist/qaws-0.2.5-aarch64-macos` |
-| `x86_64-macos` | `dist/qaws-0.2.5-x86_64-macos` |
-| `x86_64-windows-gnu` | `dist/qaws-0.2.5-x86_64-windows-gnu.exe` |
-| `aarch64-windows-gnu` | `dist/qaws-0.2.5-aarch64-windows-gnu.exe` |
-| `x86_64-freebsd` | `dist/qaws-0.2.5-x86_64-freebsd` |
+| `x86_64-linux-musl` | `dist/qaws-0.2.6-x86_64-linux-musl` |
+| `x86_64-linux-gnu` | `dist/qaws-0.2.6-x86_64-linux-gnu` |
+| `aarch64-linux-musl` | `dist/qaws-0.2.6-aarch64-linux-musl` |
+| `aarch64-linux-gnu` | `dist/qaws-0.2.6-aarch64-linux-gnu` |
+| `arm-linux-musleabihf` | `dist/qaws-0.2.6-arm-linux-musleabihf` |
+| `riscv64-linux-musl` | `dist/qaws-0.2.6-riscv64-linux-musl` |
+| `aarch64-linux-android` | `dist/qaws-0.2.6-aarch64-linux-android` |
+| `aarch64-macos` | `dist/qaws-0.2.6-aarch64-macos` |
+| `x86_64-macos` | `dist/qaws-0.2.6-x86_64-macos` |
+| `x86_64-windows-gnu` | `dist/qaws-0.2.6-x86_64-windows-gnu.exe` |
+| `aarch64-windows-gnu` | `dist/qaws-0.2.6-aarch64-windows-gnu.exe` |
+| `x86_64-freebsd` | `dist/qaws-0.2.6-x86_64-freebsd` |
 
 The release matrix intentionally excludes targets that are not practical qaws server artifacts, including WASI, iOS, tvOS, watchOS, UEFI, GPU, console, freestanding, and similar non-server environments.
 

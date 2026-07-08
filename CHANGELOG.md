@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.6
+
+- Bumped qaws version metadata, Docker tags, and documentation to 0.2.6.
+
 ### 0.2.5
 
 - Documented automatic event backend selection and high-concurrency benchmark guidance.
