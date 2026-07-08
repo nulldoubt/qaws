@@ -2,6 +2,9 @@
 
 ### 0.2.6
 
+- Reduced noisy logs for normal client disconnects during response body transfer.
+- Added pending nonblocking write state for cached event-worker responses with an internal 16-request event batch cap.
+- Added an event-worker fast path for cached `GET`, `HEAD`, and `304` responses.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.6.
 
 ### 0.2.5

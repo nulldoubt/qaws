@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.6`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, a cached event-worker fast path for small files, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -173,6 +173,8 @@ Boolean flags are available as pairs when a config file may need to be overridde
 
 qaws caches small static files by default. The cache stores file bodies up to `256 KiB`, keeps at most `16 MiB` of active cached bodies, prebuilds common response headers, and revalidates cached files after `1000` ms. When the total cache limit is reached, additional files are served through the normal uncached path instead of evicting existing entries.
 
+On evented platforms, cached safe-path `GET`, `HEAD`, and `304` responses use a nonblocking event-worker fast path. The worker writes prebuilt headers and cached bodies from pending output state, then continues with the next pipelined request only after the current response is fully sent. Complex paths, redirects, errors, uncached files, and large sendfile responses keep using the normal response path.
+
 Cache settings are JSON-only in `0.2.6`:
 
 ```json
@@ -203,6 +205,8 @@ qaws uses persistent HTTP connections by default:
 - On macOS and FreeBSD, qaws uses `kqueue` event workers.
 - Unsupported targets keep the fixed blocking worker-pool backend.
 - `--workers` controls the event-worker count on evented platforms, or the fallback worker count elsewhere. The default is the detected logical CPU count, falling back to `1`.
+- Cached event-worker responses are written without switching the socket into the blocking response path.
+- Each event tick processes a small bounded batch of ready cached requests internally, so pipelined clients cannot monopolize a worker indefinitely.
 - The server accepts up to `1024` active plus queued connections by default.
 - When the connection cap is reached, qaws returns `503 Service Unavailable` with `Connection: close`.
 - HTTP/1.1 pipelined requests on one connection are served sequentially in request order.
@@ -506,6 +510,15 @@ To compare cached and uncached static serving, run once with the default cache a
 
 ```json
 { "cache": { "enabled": false } }
+```
+
+For the small-file event fast path, compare `0.2.5` and `0.2.6` with access logs disabled and the same static file:
+
+```sh
+wrk -t1 -c1 -d10s http://127.0.0.1:18086/
+wrk -t1 -c10 -d10s http://127.0.0.1:18086/
+wrk -t8 -c100 -d10s http://127.0.0.1:18086/
+wrk -t8 -c1000 -d10s http://127.0.0.1:18086/
 ```
 
 To compare sendfile with buffered streaming for larger files, use files outside the small-file cache limit and run the same benchmark once normally and once with `--no-sendfile`:

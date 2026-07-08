@@ -16,6 +16,7 @@ const default_cache_max_total_bytes: usize = 16 * 1024 * 1024;
 const default_cache_revalidate_ms: u32 = 1000;
 const worker_stack_size = 512 * 1024;
 const log_queue_capacity = 4096;
+const event_request_batch_limit = 16;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var sendfile_fallback_logged = std.atomic.Value(bool).init(false);
@@ -260,10 +261,42 @@ const EventConnection = struct {
     request_len: usize = 0,
     served_requests: u32 = 0,
     last_active: Io.Timestamp,
+    pending: PendingEventWrite = .{},
 
     fn remote(self: *const EventConnection) []const u8 {
         return self.remote_buffer[0..self.remote_len];
     }
+
+    fn hasPendingWrite(self: *const EventConnection) bool {
+        return self.pending.active();
+    }
+};
+
+const PendingEventWrite = struct {
+    header: []const u8 = &.{},
+    body: []const u8 = &.{},
+    header_offset: usize = 0,
+    body_offset: usize = 0,
+    request_end: usize = 0,
+    served_requests_after: u32 = 0,
+    keep_open: bool = false,
+    access_start: Io.Timestamp = undefined,
+    access_record: AccessRecord = undefined,
+
+    fn active(self: *const PendingEventWrite) bool {
+        return self.request_end != 0;
+    }
+
+    fn complete(self: *const PendingEventWrite) bool {
+        return self.header_offset >= self.header.len and self.body_offset >= self.body.len;
+    }
+};
+
+const CachedEventResponse = struct {
+    status: u16,
+    bytes: u64,
+    header: []const u8,
+    body: []const u8,
 };
 
 const WakePipe = struct {
@@ -531,6 +564,21 @@ const StaticCache = struct {
         return .{ .status = 200, .bytes = if (is_head) 0 else cached.size };
     }
 
+    fn tryPrepareEventResponse(
+        self: *StaticCache,
+        io: Io,
+        root: Io.Dir,
+        relative_path: []const u8,
+        if_modified_since: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+    ) !?CachedEventResponse {
+        if (!self.enabled) return null;
+
+        const cached = try self.snapshot(io, root, relative_path, connection) orelse return null;
+        return cachedEventResponseFromSnapshot(self.last_modified, cached, if_modified_since, is_head);
+    }
+
     fn snapshot(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
         const now = Io.Timestamp.now(io, .awake);
         self.mutex.lockUncancelable(io);
@@ -655,6 +703,35 @@ const StaticCache = struct {
 fn cachedHeaderFor(connection: []const u8, keep_alive: []const u8, close: []const u8) []const u8 {
     if (std.mem.eql(u8, connection, "keep-alive")) return keep_alive;
     return close;
+}
+
+fn cachedEventResponseFromSnapshot(
+    last_modified_enabled: bool,
+    cached: CachedFileSnapshot,
+    if_modified_since: ?[]const u8,
+    is_head: bool,
+) CachedEventResponse {
+    if (last_modified_enabled) {
+        if (if_modified_since) |value| {
+            if (parseHttpDate(value)) |since| {
+                if (since >= cached.mtime_sec) {
+                    return .{
+                        .status = 304,
+                        .bytes = 0,
+                        .header = cached.header_304,
+                        .body = &.{},
+                    };
+                }
+            }
+        }
+    }
+
+    return .{
+        .status = 200,
+        .bytes = if (is_head) 0 else cached.size,
+        .header = cached.header_200,
+        .body = if (is_head) &.{} else cached.body,
+    };
 }
 
 const CliError = error{
@@ -1947,7 +2024,9 @@ fn workerLoop(context: *WorkerContext) void {
 
     while (context.queue.pop()) |stream| {
         handleConnection(context.allocator, context.io, root, stream, context.config, context.logger, context.cache) catch |err| {
-            context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+            if (!isNormalDisconnect(err)) {
+                context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
+            }
         };
         releaseConnection(context.active_connections);
     }
@@ -2000,11 +2079,31 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
                 continue;
             }
             if (connections.get(fd)) |conn| {
-                const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
-                    context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
-                    break :blk false;
-                };
-                if (!keep_open) closeEventConnection(context, &connections, fd);
+                var keep_open = true;
+                if ((event.events & std.os.linux.EPOLL.OUT) != 0 and conn.hasPendingWrite()) {
+                    keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                        if (!isNormalDisconnect(err)) {
+                            context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
+                        }
+                        break :blk false;
+                    };
+                }
+                if (keep_open and (event.events & std.os.linux.EPOLL.IN) != 0 and !conn.hasPendingWrite()) {
+                    keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                        if (!isNormalDisconnect(err)) {
+                            context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                        }
+                        break :blk false;
+                    };
+                }
+                if (!keep_open) {
+                    closeEventConnection(context, &connections, fd);
+                } else {
+                    epollSetWriteInterest(epoll_fd, fd, conn.hasPendingWrite()) catch |err| {
+                        context.logger.event("error", "epoll write interest failed: {s}", .{@errorName(err)}) catch {};
+                        closeEventConnection(context, &connections, fd);
+                    };
+                }
             }
         }
         try registerQueuedEpoll(context, epoll_fd, &connections);
@@ -2041,11 +2140,31 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
                 continue;
             }
             if (connections.get(fd)) |conn| {
-                const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
-                    context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
-                    break :blk false;
-                };
-                if (!keep_open) closeEventConnection(context, &connections, fd);
+                var keep_open = true;
+                if (event.filter == std.c.EVFILT.WRITE and conn.hasPendingWrite()) {
+                    keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                        if (!isNormalDisconnect(err)) {
+                            context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
+                        }
+                        break :blk false;
+                    };
+                }
+                if (keep_open and event.filter == std.c.EVFILT.READ and !conn.hasPendingWrite()) {
+                    keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                        if (!isNormalDisconnect(err)) {
+                            context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                        }
+                        break :blk false;
+                    };
+                }
+                if (!keep_open) {
+                    closeEventConnection(context, &connections, fd);
+                } else {
+                    kqueueSetWriteInterest(kq_fd, fd, conn.hasPendingWrite()) catch |err| {
+                        context.logger.event("error", "kqueue write interest failed: {s}", .{@errorName(err)}) catch {};
+                        closeEventConnection(context, &connections, fd);
+                    };
+                }
             }
         }
         try registerQueuedKqueue(context, kq_fd, &connections);
@@ -2160,11 +2279,14 @@ fn closeExpiredEventConnections(
 }
 
 fn eventConnectionExpired(conn: *const EventConnection, now: Io.Timestamp, config: Config) bool {
+    if (conn.hasPendingWrite()) return false;
     const idle_ms = conn.last_active.durationTo(now).toMilliseconds();
     return idle_ms >= config.keep_alive_timeout_ms;
 }
 
 fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *EventConnection) !bool {
+    if (conn.hasPendingWrite()) return flushEventPendingWrite(context, conn);
+
     while (true) {
         if (conn.request_len == conn.request_buffer.len) {
             if (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n") == null) {
@@ -2183,8 +2305,11 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         conn.last_active = Io.Timestamp.now(context.io, .awake);
     }
 
+    var processed_this_tick: usize = 0;
     while (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n")) |header_end_rel| {
         if (shutdown_requested.load(.seq_cst)) return false;
+        if (processed_this_tick >= event_request_batch_limit) return true;
+
         const request_end = header_end_rel + 4;
         const request_bytes = conn.request_buffer[0..request_end];
         const request = parseRequest(request_bytes) catch {
@@ -2193,6 +2318,13 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         };
 
         const current_request_count = conn.served_requests + 1;
+        if (try tryServeCachedEventFastPath(context, root, conn, request, request_end, current_request_count, Io.Timestamp.now(context.io, .awake))) |keep_open| {
+            processed_this_tick += 1;
+            if (!keep_open) return false;
+            if (conn.hasPendingWrite()) return true;
+            continue;
+        }
+
         try setFdNonblocking(conn.stream.socket.handle, false);
         var writer_buffer: [8192]u8 = undefined;
         var writer = conn.stream.writer(context.io, &writer_buffer);
@@ -2223,6 +2355,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
 
         if (!result.keep_open) return false;
         try setFdNonblocking(conn.stream.socket.handle, true);
+        processed_this_tick += 1;
     }
 
     if (conn.request_len == conn.request_buffer.len) {
@@ -2230,6 +2363,105 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         return false;
     }
     return true;
+}
+
+fn tryServeCachedEventFastPath(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    conn: *EventConnection,
+    request: Request,
+    request_end: usize,
+    current_request_count: u32,
+    start: Io.Timestamp,
+) !?bool {
+    if (request.has_request_body) return null;
+
+    const is_head = std.mem.eql(u8, request.method, "HEAD");
+    if (!is_head and !std.mem.eql(u8, request.method, "GET")) return null;
+
+    const relative_path = normalizeTargetFast(request.target, context.config.dotfiles) orelse return null;
+    const keep_open = requestWantsKeepAlive(request, context.config, current_request_count);
+    const response_connection = if (keep_open) "keep-alive" else "close";
+    const cached = try context.cache.tryPrepareEventResponse(
+        context.io,
+        root,
+        relative_path,
+        request.if_modified_since,
+        is_head,
+        response_connection,
+    ) orelse return null;
+
+    conn.pending = .{
+        .header = cached.header,
+        .body = cached.body,
+        .request_end = request_end,
+        .served_requests_after = current_request_count,
+        .keep_open = keep_open,
+        .access_start = start,
+        .access_record = .{
+            .remote = conn.remote(),
+            .method = request.method,
+            .target = request.target,
+            .status = cached.status,
+            .bytes = cached.bytes,
+            .duration_us = 0,
+            .user_agent = request.user_agent,
+        },
+    };
+
+    return try flushEventPendingWrite(context, conn);
+}
+
+fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) !bool {
+    while (conn.pending.active() and !conn.pending.complete()) {
+        const next = pendingWriteSlice(&conn.pending) orelse break;
+        const n = writeFd(conn.stream.socket.handle, next) catch |err| switch (err) {
+            error.WouldBlock => return true,
+            error.BrokenPipe, error.ConnectionResetByPeer, error.SocketUnconnected, error.ConnectionAborted => return false,
+            else => return err,
+        };
+        if (n == 0) return true;
+        advancePendingWrite(&conn.pending, n);
+    }
+
+    if (!conn.pending.active()) return true;
+    if (!conn.pending.complete()) return true;
+    return finishEventPendingWrite(context, conn);
+}
+
+fn pendingWriteSlice(pending: *const PendingEventWrite) ?[]const u8 {
+    if (pending.header_offset < pending.header.len) return pending.header[pending.header_offset..];
+    if (pending.body_offset < pending.body.len) return pending.body[pending.body_offset..];
+    return null;
+}
+
+fn advancePendingWrite(pending: *PendingEventWrite, written: usize) void {
+    var remaining = written;
+    if (pending.header_offset < pending.header.len) {
+        const header_remaining = pending.header.len - pending.header_offset;
+        const header_written = @min(header_remaining, remaining);
+        pending.header_offset += header_written;
+        remaining -= header_written;
+    }
+    if (remaining != 0 and pending.body_offset < pending.body.len) {
+        const body_remaining = pending.body.len - pending.body_offset;
+        pending.body_offset += @min(body_remaining, remaining);
+    }
+}
+
+fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) bool {
+    var pending = conn.pending;
+    finishAccessLog(context.logger, context.io, pending.access_start, &pending.access_record);
+
+    const remaining = conn.request_len - pending.request_end;
+    if (remaining != 0) {
+        std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[pending.request_end..conn.request_len]);
+    }
+    conn.request_len = remaining;
+    conn.served_requests = pending.served_requests_after;
+    conn.last_active = Io.Timestamp.now(context.io, .awake);
+    conn.pending = .{};
+    return pending.keep_open;
 }
 
 fn sendEventRequestError(
@@ -2326,6 +2558,9 @@ fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
                 .AGAIN => return error.WouldBlock,
                 .BADF => return error.Unexpected,
                 .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketUnconnected,
+                .CONNABORTED => return error.ConnectionAborted,
                 else => return error.Unexpected,
             }
         },
@@ -2337,9 +2572,24 @@ fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
                 .AGAIN => return error.WouldBlock,
                 .BADF => return error.Unexpected,
                 .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketUnconnected,
+                .CONNABORTED => return error.ConnectionAborted,
                 else => return error.Unexpected,
             }
         },
+    };
+}
+
+fn isNormalDisconnect(err: anyerror) bool {
+    return switch (err) {
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.SocketUnconnected,
+        error.ConnectionAborted,
+        error.EndOfStream,
+        => true,
+        else => false,
     };
 }
 
@@ -2393,7 +2643,7 @@ fn epollCreate() !std.posix.fd_t {
 
 fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
     var event = std.os.linux.epoll_event{
-        .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP,
+        .events = epollConnectionEvents(false),
         .data = .{ .fd = fd },
     };
     const rc = std.os.linux.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
@@ -2401,6 +2651,24 @@ fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
         .SUCCESS => {},
         else => return error.Unexpected,
     }
+}
+
+fn epollSetWriteInterest(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    var event = std.os.linux.epoll_event{
+        .events = epollConnectionEvents(enabled),
+        .data = .{ .fd = fd },
+    };
+    const rc = std.os.linux.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &event);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn epollConnectionEvents(write_enabled: bool) u32 {
+    var events: u32 = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP;
+    if (write_enabled) events |= std.os.linux.EPOLL.OUT;
+    return events;
 }
 
 fn epollWait(epoll_fd: std.posix.fd_t, events: []std.os.linux.epoll_event, timeout_ms: i32) !usize {
@@ -2441,6 +2709,25 @@ fn kqueueAdd(kq_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
     switch (std.posix.errno(rc)) {
         .SUCCESS => {},
         .INTR => return kqueueAdd(kq_fd, fd),
+        else => return error.Unexpected,
+    }
+}
+
+fn kqueueSetWriteInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    var changes = [_]std.posix.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.WRITE,
+        .flags = if (enabled) std.c.EV.ADD | std.c.EV.ENABLE else std.c.EV.DELETE,
+        .fflags = 0,
+        .data = 0,
+        .udata = @intCast(fd),
+    }};
+    var ignored: [1]std.posix.Kevent = undefined;
+    const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .INTR => return kqueueSetWriteInterest(kq_fd, fd, enabled),
+        .NOENT => if (!enabled) return,
         else => return error.Unexpected,
     }
 }
@@ -3125,6 +3412,7 @@ fn sendFileBody(
     switch (trySendfile(stream, file, size)) {
         .sent => return,
         .fallback => |err| {
+            if (isNormalDisconnect(err)) return err;
             logSendfileFallback(logger, err);
             try streamFile(io, out, file);
         },
@@ -3170,6 +3458,10 @@ fn trySendfileLinux(stream: Io.net.Stream, file: Io.File, size: u64) SendfileRes
             .INTR => continue,
             .AGAIN => return fallbackOrPartial(sent, error.SendfileWouldBlock),
             .INVAL, .NOSYS, .OPNOTSUPP, .NOTSOCK => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            .PIPE => return fallbackOrPartial(sent, error.BrokenPipe),
+            .CONNRESET => return fallbackOrPartial(sent, error.ConnectionResetByPeer),
+            .NOTCONN => return fallbackOrPartial(sent, error.SocketUnconnected),
+            .CONNABORTED => return fallbackOrPartial(sent, error.ConnectionAborted),
             else => return fallbackOrPartial(sent, error.SendfileFailed),
         }
     }
@@ -3190,6 +3482,10 @@ fn trySendfileDarwin(stream: Io.net.Stream, file: Io.File, size: u64) SendfileRe
             .INTR => if (transferred == 0) continue,
             .AGAIN => if (transferred == 0) return fallbackOrPartial(sent, error.SendfileWouldBlock),
             .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            .PIPE => return fallbackOrPartial(sent, error.BrokenPipe),
+            .CONNRESET => return fallbackOrPartial(sent, error.ConnectionResetByPeer),
+            .NOTCONN => return fallbackOrPartial(sent, error.SocketUnconnected),
+            .CONNABORTED => return fallbackOrPartial(sent, error.ConnectionAborted),
             else => return fallbackOrPartial(sent, error.SendfileFailed),
         }
         if (transferred == 0) break;
@@ -3214,6 +3510,10 @@ fn trySendfileFreebsd(stream: Io.net.Stream, file: Io.File, size: u64) SendfileR
             .INTR, .BUSY => if (transferred == 0) continue,
             .AGAIN => if (transferred == 0) return fallbackOrPartial(sent, error.SendfileWouldBlock),
             .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return fallbackOrPartial(sent, error.SendfileUnsupported),
+            .PIPE => return fallbackOrPartial(sent, error.BrokenPipe),
+            .CONNRESET => return fallbackOrPartial(sent, error.ConnectionResetByPeer),
+            .NOTCONN => return fallbackOrPartial(sent, error.SocketUnconnected),
+            .CONNABORTED => return fallbackOrPartial(sent, error.ConnectionAborted),
             else => return fallbackOrPartial(sent, error.SendfileFailed),
         }
         if (transferred == 0) break;
@@ -3610,6 +3910,80 @@ test "event backend timeout helpers cap wait and detect fresh connections" {
         .last_active = now,
     };
     try std.testing.expect(!eventConnectionExpired(&conn, now, .{ .keep_alive_timeout_ms = 1 }));
+
+    var pending_conn = conn;
+    pending_conn.pending = .{
+        .header = "HTTP/1.1 200 OK\r\n\r\n",
+        .request_end = 1,
+    };
+    try std.testing.expect(!eventConnectionExpired(&pending_conn, now.addDuration(Io.Duration.fromMilliseconds(5000)), .{ .keep_alive_timeout_ms = 1 }));
+}
+
+test "cached event response selection handles GET HEAD and 304" {
+    const cached = CachedFileSnapshot{
+        .body = "Bismillah.",
+        .size = 10,
+        .mtime_sec = 0,
+        .header_200 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n",
+        .header_304 = "HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n",
+    };
+
+    const get = cachedEventResponseFromSnapshot(true, cached, null, false);
+    try std.testing.expectEqual(@as(u16, 200), get.status);
+    try std.testing.expectEqual(@as(u64, 10), get.bytes);
+    try std.testing.expectEqualStrings(cached.header_200, get.header);
+    try std.testing.expectEqualStrings(cached.body, get.body);
+
+    const head = cachedEventResponseFromSnapshot(true, cached, null, true);
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqual(@as(u64, 0), head.bytes);
+    try std.testing.expectEqualStrings(cached.header_200, head.header);
+    try std.testing.expectEqual(@as(usize, 0), head.body.len);
+
+    const not_modified = cachedEventResponseFromSnapshot(true, cached, "Thu, 01 Jan 1970 00:00:00 GMT", false);
+    try std.testing.expectEqual(@as(u16, 304), not_modified.status);
+    try std.testing.expectEqual(@as(u64, 0), not_modified.bytes);
+    try std.testing.expectEqualStrings(cached.header_304, not_modified.header);
+    try std.testing.expectEqual(@as(usize, 0), not_modified.body.len);
+}
+
+test "pending event write tracks partial header and body progress" {
+    var pending = PendingEventWrite{
+        .header = "header",
+        .body = "body",
+        .request_end = 1,
+    };
+    try std.testing.expect(pending.active());
+    try std.testing.expectEqualStrings("header", pendingWriteSlice(&pending).?);
+
+    advancePendingWrite(&pending, 2);
+    try std.testing.expectEqual(@as(usize, 2), pending.header_offset);
+    try std.testing.expectEqualStrings("ader", pendingWriteSlice(&pending).?);
+
+    advancePendingWrite(&pending, 4);
+    try std.testing.expectEqual(@as(usize, 6), pending.header_offset);
+    try std.testing.expectEqual(@as(usize, 0), pending.body_offset);
+    try std.testing.expectEqualStrings("body", pendingWriteSlice(&pending).?);
+
+    advancePendingWrite(&pending, 3);
+    try std.testing.expectEqual(@as(usize, 3), pending.body_offset);
+    try std.testing.expectEqualStrings("y", pendingWriteSlice(&pending).?);
+
+    advancePendingWrite(&pending, 1);
+    try std.testing.expect(pending.complete());
+    try std.testing.expect(pendingWriteSlice(&pending) == null);
+}
+
+test "event batch limit remains internal and bounded" {
+    try std.testing.expectEqual(@as(usize, 16), event_request_batch_limit);
+}
+
+test "normal disconnect classifier covers quiet body transfer closes" {
+    try std.testing.expect(isNormalDisconnect(error.BrokenPipe));
+    try std.testing.expect(isNormalDisconnect(error.ConnectionResetByPeer));
+    try std.testing.expect(isNormalDisconnect(error.SocketUnconnected));
+    try std.testing.expect(isNormalDisconnect(error.ConnectionAborted));
+    try std.testing.expect(!isNormalDisconnect(error.SendfileFailed));
 }
 
 test "log queue preserves events and reports full access queue" {
