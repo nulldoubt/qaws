@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.4
+
+- Bumped qaws version metadata, Docker tags, and documentation to 0.2.4.
+
 ### 0.2.3
 
 - Kept async access-log drop accounting portable across 32-bit release targets.
