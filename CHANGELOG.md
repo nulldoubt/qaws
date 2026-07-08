@@ -2,6 +2,7 @@
 
 ### 0.2.4
 
+- Added `--sendfile`/`--no-sendfile` and strict JSON `http.sendfile` configuration.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.4.
 
 ### 0.2.3

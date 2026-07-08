@@ -42,6 +42,7 @@ const Config = struct {
     last_modified: bool = true,
     trailing_slash_redirect: bool = true,
     keep_alive: bool = true,
+    sendfile: bool = true,
     keep_alive_timeout_ms: u32 = default_keep_alive_timeout_ms,
     max_requests_per_connection: u32 = default_max_requests_per_connection,
     max_connections: u32 = default_max_connections,
@@ -95,6 +96,7 @@ const CliOptions = struct {
     access_log: ?bool = null,
     pid_file: ?[]const u8 = null,
     keep_alive: ?bool = null,
+    sendfile: ?bool = null,
     keep_alive_timeout_ms: ?u32 = null,
     max_requests_per_connection: ?u32 = null,
     max_connections: ?u32 = null,
@@ -150,6 +152,7 @@ const HttpConfig = struct {
     last_modified: ?bool = null,
     trailing_slash_redirect: ?bool = null,
     keep_alive: ?bool = null,
+    sendfile: ?bool = null,
     keep_alive_timeout_ms: ?u32 = null,
     max_requests_per_connection: ?u32 = null,
     max_connections: ?u32 = null,
@@ -1019,6 +1022,10 @@ fn parseCli(args: []const []const u8) CliError!CliOptions {
             cli.keep_alive = true;
         } else if (std.mem.eql(u8, arg, "--no-keep-alive")) {
             cli.keep_alive = false;
+        } else if (std.mem.eql(u8, arg, "--sendfile")) {
+            cli.sendfile = true;
+        } else if (std.mem.eql(u8, arg, "--no-sendfile")) {
+            cli.sendfile = false;
         } else if (std.mem.eql(u8, arg, "--keep-alive-timeout-ms")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -1093,6 +1100,7 @@ fn applyCliOverrides(config: *Config, cli: CliOptions) void {
     if (cli.access_log) |value| config.access_log = value;
     if (cli.pid_file) |value| config.pid_file = value;
     if (cli.keep_alive) |value| config.keep_alive = value;
+    if (cli.sendfile) |value| config.sendfile = value;
     if (cli.keep_alive_timeout_ms) |value| config.keep_alive_timeout_ms = value;
     if (cli.max_requests_per_connection) |value| config.max_requests_per_connection = value;
     if (cli.max_connections) |value| config.max_connections = value;
@@ -1158,6 +1166,7 @@ fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *Confi
         if (http.last_modified) |last_modified| config.last_modified = last_modified;
         if (http.trailing_slash_redirect) |trailing_slash_redirect| config.trailing_slash_redirect = trailing_slash_redirect;
         if (http.keep_alive) |keep_alive| config.keep_alive = keep_alive;
+        if (http.sendfile) |sendfile| config.sendfile = sendfile;
         if (http.keep_alive_timeout_ms) |timeout_ms| {
             if (timeout_ms == 0) return error.InvalidHttpConfig;
             config.keep_alive_timeout_ms = timeout_ms;
@@ -1596,6 +1605,8 @@ fn printHelp() !void {
         \\  --pid-file <path>
         \\  --keep-alive
         \\  --no-keep-alive
+        \\  --sendfile
+        \\  --no-sendfile
         \\  --keep-alive-timeout-ms <n>
         \\  --max-requests-per-connection <n>
         \\  --max-connections <n>
@@ -2761,6 +2772,7 @@ test "parse cli serve options" {
         "qaws.log",
         "--no-access-log",
         "--no-keep-alive",
+        "--no-sendfile",
         "--keep-alive-timeout-ms",
         "1500",
         "--max-requests-per-connection",
@@ -2781,6 +2793,7 @@ test "parse cli serve options" {
             try std.testing.expectEqualStrings("qaws.log", config.log_file.?);
             try std.testing.expect(!config.access_log);
             try std.testing.expect(!config.keep_alive);
+            try std.testing.expect(!config.sendfile);
             try std.testing.expectEqual(@as(u32, 1500), config.keep_alive_timeout_ms);
             try std.testing.expectEqual(@as(u32, 500), config.max_requests_per_connection);
             try std.testing.expectEqual(@as(u32, 256), config.max_connections);
@@ -2855,6 +2868,7 @@ test "json config applies values and cli overrides" {
         \\    "last_modified": false,
         \\    "trailing_slash_redirect": false,
         \\    "keep_alive": false,
+        \\    "sendfile": false,
         \\    "keep_alive_timeout_ms": 2000,
         \\    "max_requests_per_connection": 100,
         \\    "max_connections": 64,
@@ -2886,6 +2900,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expect(!config.last_modified);
     try std.testing.expect(!config.trailing_slash_redirect);
     try std.testing.expect(!config.keep_alive);
+    try std.testing.expect(!config.sendfile);
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
@@ -2901,6 +2916,7 @@ test "json config applies values and cli overrides" {
         .serve_dir = "public",
         .access_log = true,
         .keep_alive = true,
+        .sendfile = true,
         .keep_alive_timeout_ms = 3000,
         .max_requests_per_connection = 600,
         .max_connections = 128,
@@ -2911,6 +2927,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expectEqualStrings("public", config.serve_dir);
     try std.testing.expect(config.access_log);
     try std.testing.expect(config.keep_alive);
+    try std.testing.expect(config.sendfile);
     try std.testing.expectEqual(@as(u32, 3000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 600), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 128), config.max_connections);
