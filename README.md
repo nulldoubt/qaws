@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.5`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, a fixed worker pool, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -45,7 +45,7 @@ Defaults:
 | `--keep-alive-timeout-ms <n>` | `5000` | Idle timeout for persistent connections. |
 | `--max-requests-per-connection <n>` | `1000` | Maximum requests before recycling one persistent connection. |
 | `--max-connections <n>` | `1024` | Maximum active plus queued connections. |
-| `--workers <n>` | logical CPU count | Fixed worker thread count. |
+| `--workers <n>` | logical CPU count | Event-worker count on supported platforms, or fallback worker thread count elsewhere. |
 | `--access-log` / `--no-access-log` | access logs on | Enable or disable per-request access logs. |
 | `--pid-file <path>` | derived in daemon mode | PID file for daemon start/status/stop/restart. |
 
@@ -199,12 +199,15 @@ qaws uses persistent HTTP connections by default:
 - Keep-alive is enabled unless `--no-keep-alive` or `"keep_alive": false` is set.
 - Idle keep-alive connections time out after `5000` ms by default.
 - A single connection is recycled after `1000` requests by default.
-- A fixed worker pool handles accepted connections; the default worker count is the detected logical CPU count, falling back to `1`.
+- On Linux and Android, qaws uses `epoll` event workers.
+- On macOS and FreeBSD, qaws uses `kqueue` event workers.
+- Unsupported targets keep the fixed blocking worker-pool backend.
+- `--workers` controls the event-worker count on evented platforms, or the fallback worker count elsewhere. The default is the detected logical CPU count, falling back to `1`.
 - The server accepts up to `1024` active plus queued connections by default.
 - When the connection cap is reached, qaws returns `503 Service Unavailable` with `Connection: close`.
 - HTTP/1.1 pipelined requests on one connection are served sequentially in request order.
 
-These defaults stay usable on Termux and small VPS machines while avoiding per-connection thread creation overhead.
+These defaults stay usable on Termux and small VPS machines while avoiding per-connection thread creation overhead. Startup logs include the selected backend, such as `using kqueue`, `using epoll`, or `using worker`.
 
 ## Sendfile
 
@@ -489,6 +492,7 @@ wrk -t1 -c1 -d30s http://127.0.0.1:18086/
 wrk -t1 -c10 -d30s http://127.0.0.1:18086/
 wrk -t8 -c25 -d30s http://127.0.0.1:18086/
 wrk -t8 -c100 -d30s http://127.0.0.1:18086/
+wrk -t8 -c1000 -d30s http://127.0.0.1:18086/
 ```
 
 To compare old one-request-per-connection behavior, disable keep-alive:
@@ -513,9 +517,11 @@ wrk -t4 -c16 -d30s http://127.0.0.1:18086/one-mib.bin
 wrk -t4 -c16 -d30s http://127.0.0.1:18086/sixty-four-mib.bin
 ```
 
+To stress idle keep-alive handling, hold many sockets open while running an active benchmark. The event backend should continue serving active requests while idle clients wait for `keep_alive_timeout_ms`.
+
 ## Roadmap
 
-The next performance releases are expected to focus on event-loop backends such as epoll and kqueue/kevent. Later cache work may add eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
+Future performance releases may make large response bodies fully resumable in nonblocking event workers, add io_uring or IOCP where practical, and improve cache behavior with eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
 
 ## Troubleshooting
 

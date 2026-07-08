@@ -2,6 +2,7 @@
 
 ### 0.2.5
 
+- Documented automatic event backend selection and high-concurrency benchmark guidance.
 - Added automatic event-worker backends using `epoll` on Linux/Android and `kqueue` on macOS/FreeBSD with the worker pool kept as fallback.
 - Bumped qaws version metadata, Docker tags, and documentation to 0.2.5.
 
