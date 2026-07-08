@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.5
+
+- Bumped qaws version metadata, Docker tags, and documentation to 0.2.5.
+
 ### 0.2.4
 
 - Documented sendfile defaults, fallback behavior, and large-file benchmark commands.
