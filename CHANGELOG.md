@@ -2,6 +2,7 @@
 
 ### 0.2.6
 
+- Added indexed cache lookups and vectored cached-response writes to keep event fast-path overhead low.
 - Reduced noisy logs for normal client disconnects during response body transfer.
 - Added pending nonblocking write state for cached event-worker responses with an internal 16-request event batch cap.
 - Added an event-worker fast path for cached `GET`, `HEAD`, and `304` responses.

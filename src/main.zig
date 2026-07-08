@@ -262,6 +262,7 @@ const EventConnection = struct {
     served_requests: u32 = 0,
     last_active: Io.Timestamp,
     pending: PendingEventWrite = .{},
+    write_interest: bool = false,
 
     fn remote(self: *const EventConnection) []const u8 {
         return self.remote_buffer[0..self.remote_len];
@@ -500,6 +501,7 @@ const StaticCache = struct {
     headers: []const Header,
     mutex: Io.Mutex = .init,
     entries: std.ArrayList(CachedFile) = .empty,
+    entry_indexes: std.StringHashMapUnmanaged(usize) = .empty,
     retired: std.ArrayList([]u8) = .empty,
     total_body_bytes: usize = 0,
 
@@ -528,6 +530,7 @@ const StaticCache = struct {
         for (self.retired.items) |bytes| {
             if (bytes.len != 0) self.allocator.free(bytes);
         }
+        self.entry_indexes.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.retired.deinit(self.allocator);
     }
@@ -575,17 +578,25 @@ const StaticCache = struct {
     ) !?CachedEventResponse {
         if (!self.enabled) return null;
 
-        const cached = try self.snapshot(io, root, relative_path, connection) orelse return null;
+        const cached = try self.snapshotExisting(io, root, relative_path, connection) orelse return null;
         return cachedEventResponseFromSnapshot(self.last_modified, cached, if_modified_since, is_head);
     }
 
     fn snapshot(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
+        return self.snapshotWithLoad(io, root, relative_path, connection, true);
+    }
+
+    fn snapshotExisting(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
+        return self.snapshotWithLoad(io, root, relative_path, connection, false);
+    }
+
+    fn snapshotWithLoad(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8, allow_load: bool) !?CachedFileSnapshot {
         const now = Io.Timestamp.now(io, .awake);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
-        for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.path, relative_path)) continue;
+        if (self.entry_indexes.get(relative_path)) |index| {
+            const entry = &self.entries.items[index];
             if (now.nanoseconds >= entry.revalidate_after_ns) {
                 if (try self.loadEntry(io, root, relative_path, now, entry.body.len)) |fresh| {
                     self.replaceEntry(entry, fresh);
@@ -598,8 +609,11 @@ const StaticCache = struct {
             return entry.snapshot(connection);
         }
 
+        if (!allow_load) return null;
         var entry = try self.loadEntry(io, root, relative_path, now, 0) orelse return null;
         errdefer self.destroyLoadedEntry(&entry);
+        try self.entry_indexes.put(self.allocator, entry.path, self.entries.items.len);
+        errdefer _ = self.entry_indexes.remove(entry.path);
         try self.entries.append(self.allocator, entry);
         return self.entries.items[self.entries.items.len - 1].snapshot(connection);
     }
@@ -2099,7 +2113,7 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
                 if (!keep_open) {
                     closeEventConnection(context, &connections, fd);
                 } else {
-                    epollSetWriteInterest(epoll_fd, fd, conn.hasPendingWrite()) catch |err| {
+                    syncEpollWriteInterest(epoll_fd, conn) catch |err| {
                         context.logger.event("error", "epoll write interest failed: {s}", .{@errorName(err)}) catch {};
                         closeEventConnection(context, &connections, fd);
                     };
@@ -2160,7 +2174,7 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
                 if (!keep_open) {
                     closeEventConnection(context, &connections, fd);
                 } else {
-                    kqueueSetWriteInterest(kq_fd, fd, conn.hasPendingWrite()) catch |err| {
+                    syncKqueueWriteInterest(kq_fd, conn) catch |err| {
                         context.logger.event("error", "kqueue write interest failed: {s}", .{@errorName(err)}) catch {};
                         closeEventConnection(context, &connections, fd);
                     };
@@ -2414,8 +2428,7 @@ fn tryServeCachedEventFastPath(
 
 fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) !bool {
     while (conn.pending.active() and !conn.pending.complete()) {
-        const next = pendingWriteSlice(&conn.pending) orelse break;
-        const n = writeFd(conn.stream.socket.handle, next) catch |err| switch (err) {
+        const n = writePendingFd(conn.stream.socket.handle, &conn.pending) catch |err| switch (err) {
             error.WouldBlock => return true,
             error.BrokenPipe, error.ConnectionResetByPeer, error.SocketUnconnected, error.ConnectionAborted => return false,
             else => return err,
@@ -2581,6 +2594,57 @@ fn writeFd(fd: std.posix.fd_t, bytes: []const u8) !usize {
     };
 }
 
+fn writePendingFd(fd: std.posix.fd_t, pending: *const PendingEventWrite) !usize {
+    var iovecs: [2]std.posix.iovec_const = undefined;
+    var count: usize = 0;
+    if (pending.header_offset < pending.header.len) {
+        const bytes = pending.header[pending.header_offset..];
+        iovecs[count] = .{ .base = bytes.ptr, .len = bytes.len };
+        count += 1;
+    }
+    if (pending.body_offset < pending.body.len) {
+        const bytes = pending.body[pending.body_offset..];
+        iovecs[count] = .{ .base = bytes.ptr, .len = bytes.len };
+        count += 1;
+    }
+    if (count == 0) return 0;
+    return writevFd(fd, iovecs[0..count]);
+}
+
+fn writevFd(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
+    if (iovecs.len == 0) return 0;
+    return switch (builtin.os.tag) {
+        .linux => while (true) {
+            const rc = std.os.linux.writev(fd, iovecs.ptr, iovecs.len);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.Unexpected,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketUnconnected,
+                .CONNABORTED => return error.ConnectionAborted,
+                else => return error.Unexpected,
+            }
+        },
+        else => while (true) {
+            const rc = std.c.writev(fd, iovecs.ptr, @intCast(iovecs.len));
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.Unexpected,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                .NOTCONN => return error.SocketUnconnected,
+                .CONNABORTED => return error.ConnectionAborted,
+                else => return error.Unexpected,
+            }
+        },
+    };
+}
+
 fn isNormalDisconnect(err: anyerror) bool {
     return switch (err) {
         error.BrokenPipe,
@@ -2653,6 +2717,13 @@ fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
     }
 }
 
+fn syncEpollWriteInterest(epoll_fd: std.posix.fd_t, conn: *EventConnection) !void {
+    const enabled = conn.hasPendingWrite();
+    if (conn.write_interest == enabled) return;
+    try epollSetWriteInterest(epoll_fd, conn.stream.socket.handle, enabled);
+    conn.write_interest = enabled;
+}
+
 fn epollSetWriteInterest(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
     var event = std.os.linux.epoll_event{
         .events = epollConnectionEvents(enabled),
@@ -2711,6 +2782,13 @@ fn kqueueAdd(kq_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
         .INTR => return kqueueAdd(kq_fd, fd),
         else => return error.Unexpected,
     }
+}
+
+fn syncKqueueWriteInterest(kq_fd: std.posix.fd_t, conn: *EventConnection) !void {
+    const enabled = conn.hasPendingWrite();
+    if (conn.write_interest == enabled) return;
+    try kqueueSetWriteInterest(kq_fd, conn.stream.socket.handle, enabled);
+    conn.write_interest = enabled;
 }
 
 fn kqueueSetWriteInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
