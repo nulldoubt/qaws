@@ -536,6 +536,17 @@ To stress idle keep-alive handling, hold many sockets open while running an acti
 
 Future performance releases may make large response bodies fully resumable in nonblocking event workers, add io_uring or IOCP where practical, and improve cache behavior with eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
 
+## License
+
+qaws is licensed under the Apache License, Version 2.0.
+
+```text
+SPDX-License-Identifier: Apache-2.0
+Copyright 2026 M. Alkhatib
+```
+
+See [LICENSE](./LICENSE) for the full license text.
+
 ## Troubleshooting
 
 `Permission denied` or bind failure on port `80`:

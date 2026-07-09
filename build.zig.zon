@@ -11,6 +11,7 @@
         "public",
         "scripts",
         "CHANGELOG.md",
+        "LICENSE",
         "README.md",
     },
 }
