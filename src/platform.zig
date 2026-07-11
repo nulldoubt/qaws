@@ -497,11 +497,15 @@ pub fn sendfileSupportedForOs(os_tag: std.Target.Os.Tag) bool {
 }
 
 pub fn trySendfile(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
+    return trySendfileFrom(stream, file, 0, size);
+}
+
+pub fn trySendfileFrom(stream: Io.net.Stream, file: Io.File, start_offset: u64, size: u64) SendfileResult {
     if (size == 0) return .{ .sent = 0 };
     return switch (builtin.os.tag) {
-        .linux => trySendfileLinux(stream, file, size),
-        .macos => trySendfileDarwin(stream, file, size),
-        .freebsd => trySendfileFreebsd(stream, file, size),
+        .linux => trySendfileLinux(stream, file, start_offset, size),
+        .macos => trySendfileDarwin(stream, file, start_offset, size),
+        .freebsd => trySendfileFreebsd(stream, file, start_offset, size),
         else => .{ .fallback = error.SendfileUnsupported },
     };
 }
@@ -587,8 +591,8 @@ fn fallbackOrPartial(sent: u64, err: anyerror) SendfileResult {
     return .{ .partial_error = err };
 }
 
-fn trySendfileLinux(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
-    var offset: i64 = 0;
+fn trySendfileLinux(stream: Io.net.Stream, file: Io.File, start_offset: u64, size: u64) SendfileResult {
+    var offset: i64 = std.math.cast(i64, start_offset) orelse return .{ .fallback = error.FileTooBig };
     var sent: u64 = 0;
     var remaining = size;
     while (remaining != 0) {
@@ -614,8 +618,8 @@ fn trySendfileLinux(stream: Io.net.Stream, file: Io.File, size: u64) SendfileRes
     return .{ .sent = sent };
 }
 
-fn trySendfileDarwin(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
-    var offset: std.c.off_t = 0;
+fn trySendfileDarwin(stream: Io.net.Stream, file: Io.File, start_offset: u64, size: u64) SendfileResult {
+    var offset: std.c.off_t = std.math.cast(std.c.off_t, start_offset) orelse return .{ .fallback = error.FileTooBig };
     var sent: u64 = 0;
     var remaining = size;
     while (remaining != 0) {
@@ -642,8 +646,8 @@ fn trySendfileDarwin(stream: Io.net.Stream, file: Io.File, size: u64) SendfileRe
     return .{ .sent = sent };
 }
 
-fn trySendfileFreebsd(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResult {
-    var offset: std.c.off_t = 0;
+fn trySendfileFreebsd(stream: Io.net.Stream, file: Io.File, start_offset: u64, size: u64) SendfileResult {
+    var offset: std.c.off_t = std.math.cast(std.c.off_t, start_offset) orelse return .{ .fallback = error.FileTooBig };
     var sent: u64 = 0;
     var remaining = size;
     while (remaining != 0) {

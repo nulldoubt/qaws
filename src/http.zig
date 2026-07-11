@@ -52,6 +52,21 @@ pub const ResponseHeaderOptions = struct {
     vary_accept_encoding: bool = false,
 };
 
+pub const ByteRange = struct {
+    start: u64,
+    end: u64,
+
+    pub fn length(self: ByteRange) u64 {
+        return self.end - self.start + 1;
+    }
+};
+
+pub const RangeSelection = union(enum) {
+    ignore,
+    unsatisfiable,
+    satisfiable: ByteRange,
+};
+
 pub fn parseRequest(bytes: []const u8) !Request {
     return parseRequestOptions(bytes, true);
 }
@@ -381,6 +396,77 @@ fn weakEtagValue(value: []const u8) []const u8 {
         return value[2..];
     }
     return value;
+}
+
+pub fn selectByteRange(header_value: ?[]const u8, size: u64) RangeSelection {
+    const raw = header_value orelse return .ignore;
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len < 6 or !std.ascii.eqlIgnoreCase(value[0..6], "bytes=")) return .ignore;
+    const specification = std.mem.trim(u8, value[6..], " \t");
+    if (specification.len == 0) return .unsatisfiable;
+
+    if (std.mem.indexOfScalar(u8, specification, ',') != null) {
+        var members = std.mem.splitScalar(u8, specification, ',');
+        var count: usize = 0;
+        while (members.next()) |member| {
+            if (!validRangeSyntax(std.mem.trim(u8, member, " \t"))) return .unsatisfiable;
+            count += 1;
+        }
+        return if (count >= 2) .ignore else .unsatisfiable;
+    }
+
+    const dash = std.mem.indexOfScalar(u8, specification, '-') orelse return .unsatisfiable;
+    if (std.mem.indexOfScalar(u8, specification[dash + 1 ..], '-') != null) return .unsatisfiable;
+    const first = specification[0..dash];
+    const second = specification[dash + 1 ..];
+    if (first.len == 0) {
+        const suffix = parseDecimal(second) orelse return .unsatisfiable;
+        if (suffix == 0 or size == 0) return .unsatisfiable;
+        const length = @min(suffix, size);
+        return .{ .satisfiable = .{ .start = size - length, .end = size - 1 } };
+    }
+
+    const start = parseDecimal(first) orelse return .unsatisfiable;
+    if (size == 0 or start >= size) return .unsatisfiable;
+    if (second.len == 0) return .{ .satisfiable = .{ .start = start, .end = size - 1 } };
+    const requested_end = parseDecimal(second) orelse return .unsatisfiable;
+    if (requested_end < start) return .unsatisfiable;
+    return .{ .satisfiable = .{ .start = start, .end = @min(requested_end, size - 1) } };
+}
+
+pub fn ifRangeAllows(if_range: ?[]const u8, mtime_sec: i64) bool {
+    const value = if_range orelse return true;
+    const date = parseHttpDate(std.mem.trim(u8, value, " \t")) orelse return false;
+    return date >= mtime_sec;
+}
+
+pub fn formatContentRange(range: ByteRange, size: u64, buffer: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    writer.print("bytes {d}-{d}/{d}", .{ range.start, range.end, size }) catch return "";
+    return writer.buffered();
+}
+
+pub fn formatUnsatisfiedContentRange(size: u64, buffer: []u8) []const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    writer.print("bytes */{d}", .{size}) catch return "";
+    return writer.buffered();
+}
+
+fn validRangeSyntax(value: []const u8) bool {
+    const dash = std.mem.indexOfScalar(u8, value, '-') orelse return false;
+    if (std.mem.indexOfScalar(u8, value[dash + 1 ..], '-') != null) return false;
+    const first = value[0..dash];
+    const second = value[dash + 1 ..];
+    if (first.len == 0 and second.len == 0) return false;
+    if (first.len != 0 and parseDecimal(first) == null) return false;
+    if (second.len != 0 and parseDecimal(second) == null) return false;
+    return true;
+}
+
+fn parseDecimal(value: []const u8) ?u64 {
+    if (value.len == 0) return null;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return std.fmt.parseInt(u64, value, 10) catch null;
 }
 
 fn parseHttpMonth(value: []const u8) ?u8 {

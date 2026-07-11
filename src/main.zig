@@ -105,6 +105,10 @@ const parseHttpDate = http.parseHttpDate;
 const formatWeakEtag = http.formatWeakEtag;
 const ifNoneMatchMatches = http.ifNoneMatchMatches;
 const isNotModified = http.isNotModified;
+const selectByteRange = http.selectByteRange;
+const ifRangeAllows = http.ifRangeAllows;
+const formatContentRange = http.formatContentRange;
+const formatUnsatisfiedContentRange = http.formatUnsatisfiedContentRange;
 const sendHeaders = http.sendHeaders;
 const buildHeaderAlloc = http.buildHeaderAlloc;
 const mimeType = http.mimeType;
@@ -1471,6 +1475,7 @@ test "json config applies values and cli overrides" {
         \\    "keep_alive": false,
         \\    "sendfile": false,
         \\    "etag": false,
+        \\    "range_requests": false,
         \\    "keep_alive_timeout_ms": 2000,
         \\    "max_requests_per_connection": 100,
         \\    "max_connections": 64,
@@ -1504,6 +1509,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expect(!config.keep_alive);
     try std.testing.expect(!config.sendfile);
     try std.testing.expect(!config.etag);
+    try std.testing.expect(!config.range_requests);
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
@@ -1700,6 +1706,27 @@ test "weak etags and conditional precedence follow HTTP rules" {
     try std.testing.expect(isNotModified(etag, "Thu, 01 Jan 1970 00:00:00 GMT", etag, 0, true));
     try std.testing.expect(!isNotModified("W/\"different\"", "Thu, 01 Jan 2100 00:00:00 GMT", etag, 0, true));
     try std.testing.expect(isNotModified(null, "Thu, 01 Jan 1970 00:00:00 GMT", etag, 0, true));
+}
+
+test "byte range selection supports single forms and ignores multipart sets" {
+    const normal = selectByteRange("bytes=2-5", 10).satisfiable;
+    try std.testing.expectEqual(@as(u64, 2), normal.start);
+    try std.testing.expectEqual(@as(u64, 5), normal.end);
+    try std.testing.expectEqual(@as(u64, 4), normal.length());
+
+    const open = selectByteRange("bytes=7-", 10).satisfiable;
+    try std.testing.expectEqual(@as(u64, 9), open.end);
+    const suffix = selectByteRange("bytes=-20", 10).satisfiable;
+    try std.testing.expectEqual(@as(u64, 0), suffix.start);
+    try std.testing.expectEqual(http.RangeSelection.unsatisfiable, selectByteRange("bytes=10-", 10));
+    try std.testing.expectEqual(http.RangeSelection.ignore, selectByteRange("bytes=0-1, 4-5", 10));
+    try std.testing.expectEqual(http.RangeSelection.unsatisfiable, selectByteRange("bytes=0-1, broken", 10));
+
+    try std.testing.expect(ifRangeAllows("Thu, 01 Jan 1970 00:00:00 GMT", 0));
+    try std.testing.expect(!ifRangeAllows("W/\"weak\"", 0));
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("bytes 2-5/10", formatContentRange(normal, 10, &buffer));
+    try std.testing.expectEqualStrings("bytes */10", formatUnsatisfiedContentRange(10, &buffer));
 }
 
 test "runtime path component sanitization" {

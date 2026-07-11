@@ -37,6 +37,8 @@ const Generation = struct {
     mtime_ns: i96,
     etag_buffer: [128]u8,
     etag_len: usize,
+    last_modified_buffer: [64]u8,
+    last_modified_len: usize,
     response_200_keep_alive: []u8,
     header_200_keep_alive_len: usize,
     header_200_close: []u8,
@@ -51,6 +53,7 @@ const Generation = struct {
             .mtime_sec = self.mtime_sec,
             .mtime_ns = self.mtime_ns,
             .etag = if (self.etag_len == 0) null else self.etag_buffer[0..self.etag_len],
+            .last_modified = if (self.last_modified_len == 0) null else self.last_modified_buffer[0..self.last_modified_len],
             .header_200 = if (keep_alive)
                 self.response_200_keep_alive[0..self.header_200_keep_alive_len]
             else
@@ -114,6 +117,7 @@ pub const CachedEventResponse = struct {
     header: []const u8,
     body: []const u8,
     lease: ?CacheLease = null,
+    owns_header: bool = false,
 };
 
 pub const CachedFileSnapshot = struct {
@@ -122,6 +126,7 @@ pub const CachedFileSnapshot = struct {
     mtime_sec: i64,
     mtime_ns: i96 = 0,
     etag: ?[]const u8 = null,
+    last_modified: ?[]const u8 = null,
     header_200: []const u8,
     header_304: []const u8,
     response_200: []const u8,
@@ -140,6 +145,7 @@ pub const StaticCache = struct {
     revalidate_ms: u32,
     last_modified: bool,
     etag: bool,
+    range_requests: bool,
     headers: []const config_mod.Header,
     metadata_mutex: Io.Mutex = .init,
     slots: SlotMap = .empty,
@@ -154,6 +160,7 @@ pub const StaticCache = struct {
             .revalidate_ms = config.cache_revalidate_ms,
             .last_modified = config.last_modified,
             .etag = config.etag,
+            .range_requests = config.range_requests,
             .headers = config.headers,
         };
     }
@@ -256,6 +263,8 @@ pub const CacheView = struct {
         relative_path: []const u8,
         if_none_match: ?[]const u8,
         if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
         is_head: bool,
         connection: []const u8,
     ) !?http.ResponseResult {
@@ -266,10 +275,13 @@ pub const CacheView = struct {
             .identity,
             if_none_match,
             if_modified_since,
+            range_value,
+            if_range,
             is_head,
             connection,
         ) orelse return null;
         defer if (prepared.lease) |*lease| lease.release();
+        defer if (prepared.owns_header) self.cache.allocator.free(@constCast(prepared.header));
 
         try out.writeAll(prepared.header);
         if (prepared.body.len != 0) try out.writeAll(prepared.body);
@@ -283,6 +295,8 @@ pub const CacheView = struct {
         relative_path: []const u8,
         if_none_match: ?[]const u8,
         if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
         is_head: bool,
         connection: []const u8,
     ) !?CachedEventResponse {
@@ -293,6 +307,8 @@ pub const CacheView = struct {
             .identity,
             if_none_match,
             if_modified_since,
+            range_value,
+            if_range,
             is_head,
             connection,
         );
@@ -306,6 +322,8 @@ pub const CacheView = struct {
         representation: Representation,
         if_none_match: ?[]const u8,
         if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
         is_head: bool,
         connection: []const u8,
     ) !?CachedEventResponse {
@@ -336,8 +354,89 @@ pub const CacheView = struct {
             if_modified_since,
             is_head,
         );
+        if (response.status == 200 and self.cache.range_requests and http.ifRangeAllows(if_range, generation.mtime_sec)) {
+            response = try self.rangeResponse(
+                generation.snapshot(connection),
+                logical_path,
+                range_value,
+                is_head,
+                connection,
+            );
+        }
         response.lease = lease;
         return response;
+    }
+
+    fn rangeResponse(
+        self: *CacheView,
+        cached: CachedFileSnapshot,
+        logical_path: []const u8,
+        range_value: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+    ) !CachedEventResponse {
+        return switch (http.selectByteRange(range_value, cached.size)) {
+            .ignore => cachedEventResponseFromSnapshot(
+                self.cache.last_modified,
+                cached,
+                null,
+                null,
+                is_head,
+            ),
+            .unsatisfiable => blk: {
+                const body = "Range not satisfiable\n";
+                var content_range_buffer: [64]u8 = undefined;
+                const content_range = http.formatUnsatisfiedContentRange(cached.size, &content_range_buffer);
+                const header = try http.buildHeaderAllocExtended(
+                    self.cache.allocator,
+                    .{ .code = 416, .reason = "Range Not Satisfiable" },
+                    "text/plain; charset=utf-8",
+                    body.len,
+                    connection,
+                    self.cache.headers,
+                    .{
+                        .last_modified = cached.last_modified,
+                        .etag = cached.etag,
+                        .accept_ranges = true,
+                        .content_range = content_range,
+                    },
+                );
+                break :blk .{
+                    .status = 416,
+                    .bytes = if (is_head) 0 else body.len,
+                    .header = header,
+                    .body = if (is_head) &.{} else body,
+                    .owns_header = true,
+                };
+            },
+            .satisfiable => |range| blk: {
+                var content_range_buffer: [96]u8 = undefined;
+                const content_range = http.formatContentRange(range, cached.size, &content_range_buffer);
+                const header = try http.buildHeaderAllocExtended(
+                    self.cache.allocator,
+                    .{ .code = 206, .reason = "Partial Content" },
+                    http.mimeType(logical_path),
+                    range.length(),
+                    connection,
+                    self.cache.headers,
+                    .{
+                        .last_modified = cached.last_modified,
+                        .etag = cached.etag,
+                        .accept_ranges = true,
+                        .content_range = content_range,
+                    },
+                );
+                const start: usize = @intCast(range.start);
+                const end: usize = @intCast(range.end + 1);
+                break :blk .{
+                    .status = 206,
+                    .bytes = if (is_head) 0 else range.length(),
+                    .header = header,
+                    .body = if (is_head) &.{} else cached.body[start..end],
+                    .owns_header = true,
+                };
+            },
+        };
     }
 
     fn viewEntry(self: *CacheView, slot: *CacheSlot) !*ViewEntry {
@@ -462,7 +561,7 @@ fn buildGeneration(
         stat.size,
         "keep-alive",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
     );
     defer cache.allocator.free(header_200_keep_alive);
 
@@ -478,7 +577,7 @@ fn buildGeneration(
         stat.size,
         "close",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
     );
     errdefer cache.allocator.free(header_200_close);
     const header_304_keep_alive = try http.buildHeaderAllocExtended(
@@ -488,7 +587,7 @@ fn buildGeneration(
         0,
         "keep-alive",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
     );
     errdefer cache.allocator.free(header_304_keep_alive);
     const header_304_close = try http.buildHeaderAllocExtended(
@@ -498,7 +597,7 @@ fn buildGeneration(
         0,
         "close",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
     );
     errdefer cache.allocator.free(header_304_close);
 
@@ -519,6 +618,8 @@ fn buildGeneration(
         .mtime_ns = stat.mtime.nanoseconds,
         .etag_buffer = undefined,
         .etag_len = if (etag) |value| value.len else 0,
+        .last_modified_buffer = undefined,
+        .last_modified_len = if (last_modified) |value| value.len else 0,
         .response_200_keep_alive = response_200_keep_alive,
         .header_200_keep_alive_len = header_200_keep_alive.len,
         .header_200_close = header_200_close,
@@ -526,6 +627,7 @@ fn buildGeneration(
         .header_304_close = header_304_close,
     };
     if (etag) |value| @memcpy(generation.etag_buffer[0..value.len], value);
+    if (last_modified) |value| @memcpy(generation.last_modified_buffer[0..value.len], value);
     return generation;
 }
 
@@ -616,6 +718,8 @@ test "cache generations revalidate and reclaim old response storage" {
         "index.html",
         null,
         null,
+        null,
+        null,
         false,
         "keep-alive",
     )).?;
@@ -635,6 +739,8 @@ test "cache generations revalidate and reclaim old response storage" {
         "index.html",
         null,
         null,
+        null,
+        null,
         false,
         "keep-alive",
     )).?;
@@ -643,6 +749,8 @@ test "cache generations revalidate and reclaim old response storage" {
     var second = (try second_view.tryPrepareEventResponse(
         temporary.dir,
         "index.html",
+        null,
+        null,
         null,
         null,
         false,
@@ -656,6 +764,8 @@ test "cache generations revalidate and reclaim old response storage" {
     var fresh = (try first_view.tryPrepareEventResponse(
         temporary.dir,
         "index.html",
+        null,
+        null,
         null,
         null,
         false,
@@ -690,6 +800,8 @@ test "cache serves uncached when metadata cannot fit the cap" {
     try std.testing.expect(try view.tryPrepareEventResponse(
         temporary.dir,
         "index.html",
+        null,
+        null,
         null,
         null,
         false,

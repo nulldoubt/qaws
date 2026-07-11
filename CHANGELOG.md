@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Added configurable single byte ranges with `206`, `416`, suffix/open forms, date `If-Range`, and cached/sendfile support.
 - Added weak representation ETags with strict JSON control and `If-None-Match` precedence over date validators.
 - Rebuilt the memory cache around worker-local views, immutable generations, stat-first per-path refresh, and complete resident-byte accounting.
 - Hardened the allocation-free request parser for Host, framing, body-length, and transfer-encoding validation.

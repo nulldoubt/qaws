@@ -40,6 +40,7 @@ pub const Config = struct {
     keep_alive: bool = true,
     sendfile: bool = true,
     etag: bool = true,
+    range_requests: bool = true,
     keep_alive_timeout_ms: u32 = default_keep_alive_timeout_ms,
     max_requests_per_connection: u32 = default_max_requests_per_connection,
     max_connections: u32 = default_max_connections,
@@ -95,6 +96,7 @@ pub const HttpConfig = struct {
     keep_alive: ?bool = null,
     sendfile: ?bool = null,
     etag: ?bool = null,
+    range_requests: ?bool = null,
     keep_alive_timeout_ms: ?u32 = null,
     max_requests_per_connection: ?u32 = null,
     max_connections: ?u32 = null,
@@ -149,6 +151,7 @@ pub fn applyFileConfig(allocator: Allocator, file_config: FileConfig, config: *C
         if (http.keep_alive) |keep_alive| config.keep_alive = keep_alive;
         if (http.sendfile) |sendfile| config.sendfile = sendfile;
         if (http.etag) |etag| config.etag = etag;
+        if (http.range_requests) |range_requests| config.range_requests = range_requests;
         if (http.keep_alive_timeout_ms) |timeout_ms| {
             if (timeout_ms == 0) return error.InvalidHttpConfig;
             config.keep_alive_timeout_ms = timeout_ms;

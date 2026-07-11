@@ -62,6 +62,10 @@ const buildHeaderAllocExtended = http.buildHeaderAllocExtended;
 const mimeType = http.mimeType;
 const formatWeakEtag = http.formatWeakEtag;
 const isNotModified = http.isNotModified;
+const selectByteRange = http.selectByteRange;
+const ifRangeAllows = http.ifRangeAllows;
+const formatContentRange = http.formatContentRange;
+const formatUnsatisfiedContentRange = http.formatUnsatisfiedContentRange;
 const CachedEventResponse = cache_mod.CachedEventResponse;
 const CachedFileSnapshot = cache_mod.CachedFileSnapshot;
 const CacheLease = cache_mod.CacheLease;
@@ -102,6 +106,7 @@ const kqueueSetReadInterestUserData = platform.kqueueSetReadInterestUserData;
 const kqueueWait = platform.kqueueWait;
 const sendfileSupportedForOs = platform.sendfileSupportedForOs;
 const trySendfile = platform.trySendfile;
+const trySendfileFrom = platform.trySendfileFrom;
 const trySendfileStep = platform.trySendfileStep;
 
 pub const FileTransferPath = enum {
@@ -1139,11 +1144,8 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                     "text/plain; charset=utf-8",
                     "Request too large\n",
                     true,
-                    null,
                     &.{},
-                    null,
-                    null,
-                    null,
+                    .{},
                 );
                 return flushEventPendingWrite(context, conn, batch_now);
             }
@@ -1181,11 +1183,8 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                 "text/plain; charset=utf-8",
                 "Bad request\n",
                 true,
-                null,
                 &.{},
-                null,
-                null,
-                null,
+                .{},
             );
             return flushEventPendingWrite(context, conn, batch_now);
         };
@@ -1221,11 +1220,8 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
             "text/plain; charset=utf-8",
             "Request too large\n",
             true,
-            null,
             &.{},
-            null,
-            null,
-            null,
+            .{},
         );
         return flushEventPendingWrite(context, conn, batch_now);
     }
@@ -1275,11 +1271,8 @@ fn prepareEventResponse(
             "text/plain; charset=utf-8",
             "Bad request\n",
             true,
-            null,
             &.{},
-            null,
-            null,
-            null,
+            .{},
         );
         return;
     }
@@ -1301,11 +1294,8 @@ fn prepareEventResponse(
             "text/plain; charset=utf-8",
             "Method not allowed\n",
             true,
-            "GET, HEAD",
             &.{},
-            null,
-            null,
-            null,
+            .{ .allow = "GET, HEAD" },
         );
         return;
     }
@@ -1328,11 +1318,8 @@ fn prepareEventResponse(
                 "text/plain; charset=utf-8",
                 "Forbidden\n",
                 !is_head,
-                null,
                 &.{},
-                null,
-                null,
-                null,
+                .{},
             );
             return;
         };
@@ -1371,6 +1358,8 @@ fn prepareEventPath(
         relative_path,
         request.if_none_match,
         request.if_modified_since,
+        request.range,
+        request.if_range,
         is_head,
         response_connection,
     );
@@ -1382,6 +1371,7 @@ fn prepareEventPath(
             .served_requests_after = current_request_count,
             .keep_open = keep_open,
             .cache_lease = response.lease,
+            .owns_header = response.owns_header,
         };
         setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, response.status, response.bytes);
         return;
@@ -1407,11 +1397,8 @@ fn prepareEventPath(
                 "text/plain; charset=utf-8",
                 "Not found\n",
                 !is_head,
-                null,
                 &.{},
-                null,
-                null,
-                null,
+                .{},
             );
             return;
         },
@@ -1433,11 +1420,8 @@ fn prepareEventPath(
                     "text/plain; charset=utf-8",
                     "Redirecting\n",
                     !is_head,
-                    null,
                     context.config.headers,
-                    null,
-                    null,
-                    location,
+                    .{ .location = location },
                 );
                 return;
             }
@@ -1471,11 +1455,8 @@ fn prepareEventPath(
                 "text/plain; charset=utf-8",
                 "Forbidden\n",
                 !is_head,
-                null,
                 &.{},
-                null,
-                null,
-                null,
+                .{},
             );
             return;
         },
@@ -1502,11 +1483,8 @@ fn prepareEventPath(
             "text/plain; charset=utf-8",
             "Not found\n",
             !is_head,
-            null,
             &.{},
-            null,
-            null,
-            null,
+            .{},
         );
         return;
     }
@@ -1533,23 +1511,74 @@ fn prepareEventPath(
             content_type,
             "",
             false,
-            null,
             context.config.headers,
-            last_modified,
-            etag,
-            null,
+            .{ .last_modified = last_modified, .etag = etag },
         );
         return;
     }
 
+    var selected_range: ?http.ByteRange = null;
+    if (context.config.range_requests and ifRangeAllows(request.if_range, stat.mtime.toSeconds())) {
+        switch (selectByteRange(request.range, stat.size)) {
+            .ignore => {},
+            .unsatisfiable => {
+                file.close(context.io);
+                file_owned = false;
+                const body = "Range not satisfiable\n";
+                var content_range_buffer: [64]u8 = undefined;
+                const content_range = formatUnsatisfiedContentRange(stat.size, &content_range_buffer);
+                try queueEventMemoryResponse(
+                    context,
+                    conn,
+                    request_end,
+                    current_request_count,
+                    keep_open,
+                    start,
+                    request.method,
+                    request.target,
+                    request.user_agent,
+                    .{ .code = 416, .reason = "Range Not Satisfiable" },
+                    "text/plain; charset=utf-8",
+                    body,
+                    !is_head,
+                    context.config.headers,
+                    .{
+                        .last_modified = last_modified,
+                        .etag = etag,
+                        .accept_ranges = true,
+                        .content_range = content_range,
+                    },
+                );
+                return;
+            },
+            .satisfiable => |range| selected_range = range,
+        }
+    }
+
+    var content_range_buffer: [96]u8 = undefined;
+    const content_range = if (selected_range) |range|
+        formatContentRange(range, stat.size, &content_range_buffer)
+    else
+        null;
+    const response_status: ResponseStatus = if (selected_range != null)
+        .{ .code = 206, .reason = "Partial Content" }
+    else
+        .{ .code = 200, .reason = "OK" };
+    const response_size = if (selected_range) |range| range.length() else stat.size;
+
     const header = try buildHeaderAllocExtended(
         context.allocator,
-        .{ .code = 200, .reason = "OK" },
+        response_status,
         content_type,
-        stat.size,
+        response_size,
         response_connection,
         context.config.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = context.config.range_requests,
+            .content_range = content_range,
+        },
     );
     errdefer context.allocator.free(header);
 
@@ -1564,10 +1593,11 @@ fn prepareEventPath(
         .keep_open = keep_open,
         .owns_header = true,
         .file = if (is_head) null else file,
-        .file_remaining = if (is_head) 0 else stat.size,
+        .file_offset = if (selected_range) |range| range.start else 0,
+        .file_remaining = if (is_head) 0 else response_size,
         .use_sendfile = !is_head and context.config.sendfile and sendfileSupportedForOs(builtin.os.tag),
     };
-    setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, 200, if (is_head) 0 else stat.size);
+    setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, response_status.code, if (is_head) 0 else response_size);
     file_owned = false;
 }
 
@@ -1585,11 +1615,8 @@ fn queueEventMemoryResponse(
     content_type: []const u8,
     body: []const u8,
     send_body: bool,
-    allow: ?[]const u8,
     extra_headers: []const Header,
-    last_modified: ?[]const u8,
-    etag: ?[]const u8,
-    location: ?[]const u8,
+    options: http.ResponseHeaderOptions,
 ) !void {
     const connection = if (keep_open) "keep-alive" else "close";
     const header = try buildHeaderAllocExtended(
@@ -1599,7 +1626,7 @@ fn queueEventMemoryResponse(
         body.len,
         connection,
         extra_headers,
-        .{ .allow = allow, .last_modified = last_modified, .etag = etag, .location = location },
+        options,
     );
     conn.pending = .{
         .header = header,
@@ -1921,6 +1948,8 @@ fn processParsedRequest(
         request.target,
         request.if_none_match,
         request.if_modified_since,
+        request.range,
+        request.if_range,
         is_head,
         response_connection,
         config,
@@ -2053,13 +2082,15 @@ fn servePath(
     request_target: []const u8,
     if_none_match: ?[]const u8,
     if_modified_since: ?[]const u8,
+    range_value: ?[]const u8,
+    if_range: ?[]const u8,
     is_head: bool,
     connection: []const u8,
     config: Config,
     logger: *Logger,
     cache: *CacheView,
 ) !ResponseResult {
-    if (try cache.tryServe(root, out, stream_writer, relative_path, if_none_match, if_modified_since, is_head, connection)) |result| {
+    if (try cache.tryServe(root, out, stream_writer, relative_path, if_none_match, if_modified_since, range_value, if_range, is_head, connection)) |result| {
         return result;
     }
 
@@ -2077,7 +2108,7 @@ fn servePath(
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, is_head, connection, config, logger, cache);
+            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, range_value, if_range, is_head, connection, config, logger, cache);
         },
         error.AccessDenied => {
             return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
@@ -2110,32 +2141,80 @@ fn servePath(
         return .{ .status = 304, .bytes = 0 };
     }
 
+    var selected_range: ?http.ByteRange = null;
+    if (config.range_requests and ifRangeAllows(if_range, stat.mtime.toSeconds())) {
+        switch (selectByteRange(range_value, stat.size)) {
+            .ignore => {},
+            .unsatisfiable => {
+                const body = "Range not satisfiable\n";
+                var content_range_buffer: [64]u8 = undefined;
+                const content_range = formatUnsatisfiedContentRange(stat.size, &content_range_buffer);
+                try sendHeadersExtended(
+                    out,
+                    .{ .code = 416, .reason = "Range Not Satisfiable" },
+                    "text/plain; charset=utf-8",
+                    body.len,
+                    connection,
+                    config.headers,
+                    .{
+                        .last_modified = last_modified,
+                        .etag = etag,
+                        .accept_ranges = true,
+                        .content_range = content_range,
+                    },
+                );
+                if (!is_head) try out.writeAll(body);
+                try stream_writer.interface.flush();
+                return .{ .status = 416, .bytes = if (is_head) 0 else body.len };
+            },
+            .satisfiable => |range| selected_range = range,
+        }
+    }
+
+    var content_range_buffer: [96]u8 = undefined;
+    const content_range = if (selected_range) |range|
+        formatContentRange(range, stat.size, &content_range_buffer)
+    else
+        null;
+    const response_status: ResponseStatus = if (selected_range != null)
+        .{ .code = 206, .reason = "Partial Content" }
+    else
+        .{ .code = 200, .reason = "OK" };
+    const response_size = if (selected_range) |range| range.length() else stat.size;
+    const response_offset = if (selected_range) |range| range.start else 0;
+
     try sendHeadersExtended(
         out,
-        .{ .code = 200, .reason = "OK" },
+        response_status,
         content_type,
-        stat.size,
+        response_size,
         connection,
         config.headers,
-        .{ .last_modified = last_modified, .etag = etag },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = config.range_requests,
+            .content_range = content_range,
+        },
     );
     if (!is_head) {
-        try sendFileBody(io, stream, out, stream_writer, file, stat.size, config, logger);
+        try sendFileBody(io, stream, out, stream_writer, file, response_offset, response_size, config, logger);
     }
     try stream_writer.interface.flush();
-    return .{ .status = 200, .bytes = if (is_head) 0 else stat.size };
+    return .{ .status = response_status.code, .bytes = if (is_head) 0 else response_size };
 }
 
-fn streamFile(io: Io, out: *Io.Writer, file: Io.File) !void {
+fn streamFile(io: Io, out: *Io.Writer, file: Io.File, start_offset: u64, size: u64) !void {
     var file_buffer: [64 * 1024]u8 = undefined;
-    var reader = file.reader(io, &.{});
-
-    while (true) {
-        const n = reader.interface.readSliceShort(&file_buffer) catch |err| switch (err) {
-            error.ReadFailed => return reader.err orelse err,
-        };
-        if (n == 0) break;
-        try out.writeAll(file_buffer[0..n]);
+    var offset = start_offset;
+    var remaining = size;
+    while (remaining != 0) {
+        const read_len: usize = @intCast(@min(remaining, file_buffer.len));
+        const count = try file.readPositionalAll(io, file_buffer[0..read_len], offset);
+        if (count == 0) return error.EndOfStream;
+        try out.writeAll(file_buffer[0..count]);
+        offset += count;
+        remaining -= count;
     }
 }
 
@@ -2151,22 +2230,23 @@ fn sendFileBody(
     out: *Io.Writer,
     stream_writer: *Io.net.Stream.Writer,
     file: Io.File,
+    start_offset: u64,
     size: u64,
     config: Config,
     logger: *Logger,
 ) !void {
     if (selectFileTransferPath(config, false, false) != .sendfile) {
-        try streamFile(io, out, file);
+        try streamFile(io, out, file, start_offset, size);
         return;
     }
 
     try stream_writer.interface.flush();
-    switch (trySendfile(stream, file, size)) {
+    switch (trySendfileFrom(stream, file, start_offset, size)) {
         .sent => return,
         .fallback => |err| {
             if (isNormalDisconnect(err)) return err;
             logSendfileFallback(logger, err);
-            try streamFile(io, out, file);
+            try streamFile(io, out, file, start_offset, size);
         },
         .partial_error => |err| return err,
     }
