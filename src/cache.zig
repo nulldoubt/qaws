@@ -82,8 +82,8 @@ const CacheSlot = struct {
     representation: Representation,
     refresh_mutex: Io.Mutex = .init,
     current: ?*Generation = null,
-    version: std.atomic.Value(u64) = .init(0),
-    revalidate_after_ms: std.atomic.Value(i64) = .init(0),
+    version: std.atomic.Value(u32) = .init(0),
+    revalidate_after_ms: i64 = 0,
     availability: std.atomic.Value(u8) = .init(@intFromEnum(Availability.unknown)),
     memory_bytes: usize,
 
@@ -102,7 +102,8 @@ const SlotMap = std.HashMapUnmanaged(
 const ViewEntry = struct {
     slot: *CacheSlot,
     generation: ?*Generation = null,
-    version: u64 = std.math.maxInt(u64),
+    version: u32 = std.math.maxInt(u32),
+    revalidate_after_ms: i64 = 0,
 };
 
 const ViewMap = std.HashMapUnmanaged(
@@ -448,8 +449,8 @@ pub const CacheView = struct {
         const slot = entry.slot;
 
         const now_ms = timestampMilliseconds(now);
-        if (now_ms >= slot.revalidate_after_ms.load(.monotonic)) {
-            try self.refresh(root, slot, now, now_ms);
+        if (now_ms >= entry.revalidate_after_ms) {
+            entry.revalidate_after_ms = try self.refresh(root, slot, now, now_ms);
         }
         self.syncEntry(entry);
 
@@ -493,8 +494,8 @@ pub const CacheView = struct {
         const slot = entry.slot;
         const now = Io.Timestamp.now(self.io, .awake);
         const now_ms = timestampMilliseconds(now);
-        if (now_ms >= slot.revalidate_after_ms.load(.monotonic)) {
-            try self.refresh(root, slot, now, now_ms);
+        if (now_ms >= entry.revalidate_after_ms) {
+            entry.revalidate_after_ms = try self.refresh(root, slot, now, now_ms);
         }
         return @enumFromInt(slot.availability.load(.monotonic));
     }
@@ -622,7 +623,7 @@ pub const CacheView = struct {
         slot: *CacheSlot,
         now: Io.Timestamp,
         now_ms: i64,
-    ) !void {
+    ) !i64 {
         var old_generation: ?*Generation = null;
         slot.refresh_mutex.lockUncancelable(self.io);
         defer {
@@ -630,7 +631,7 @@ pub const CacheView = struct {
             if (old_generation) |generation| releaseGeneration(self.io, generation);
         }
 
-        if (now_ms < slot.revalidate_after_ms.load(.monotonic)) return;
+        if (now_ms < slot.revalidate_after_ms) return slot.revalidate_after_ms;
         const next_revalidation = addMilliseconds(now_ms, self.cache.revalidate_ms);
 
         var file = root.openFile(self.io, slot.physical_path, .{
@@ -646,8 +647,8 @@ pub const CacheView = struct {
                 };
                 old_generation = replaceCurrent(slot, null);
                 slot.availability.store(@intFromEnum(availability), .monotonic);
-                slot.revalidate_after_ms.store(next_revalidation, .monotonic);
-                return;
+                slot.revalidate_after_ms = next_revalidation;
+                return next_revalidation;
             },
             else => return err,
         };
@@ -656,8 +657,8 @@ pub const CacheView = struct {
         const stat = try file.stat(self.io);
         const body_len = std.math.cast(usize, stat.size) orelse {
             old_generation = replaceCurrent(slot, null);
-            slot.revalidate_after_ms.store(next_revalidation, .monotonic);
-            return;
+            slot.revalidate_after_ms = next_revalidation;
+            return next_revalidation;
         };
         if (stat.kind != .file or body_len > self.cache.max_file_bytes) {
             old_generation = replaceCurrent(slot, null);
@@ -665,27 +666,28 @@ pub const CacheView = struct {
                 @intFromEnum(if (stat.kind == .file) Availability.uncached else Availability.unavailable),
                 .monotonic,
             );
-            slot.revalidate_after_ms.store(next_revalidation, .monotonic);
-            return;
+            slot.revalidate_after_ms = next_revalidation;
+            return next_revalidation;
         }
 
         if (slot.current) |current| {
             if (current.size == stat.size and current.mtime_ns == stat.mtime.nanoseconds) {
                 slot.availability.store(@intFromEnum(Availability.cached), .monotonic);
-                slot.revalidate_after_ms.store(next_revalidation, .monotonic);
-                return;
+                slot.revalidate_after_ms = next_revalidation;
+                return next_revalidation;
             }
         }
 
         const fresh = try buildGeneration(self.cache, self.io, file, stat, slot.path, slot.representation, now) orelse {
             old_generation = replaceCurrent(slot, null);
             slot.availability.store(@intFromEnum(Availability.uncached), .monotonic);
-            slot.revalidate_after_ms.store(next_revalidation, .monotonic);
-            return;
+            slot.revalidate_after_ms = next_revalidation;
+            return next_revalidation;
         };
         old_generation = replaceCurrent(slot, fresh);
         slot.availability.store(@intFromEnum(Availability.cached), .monotonic);
-        slot.revalidate_after_ms.store(next_revalidation, .monotonic);
+        slot.revalidate_after_ms = next_revalidation;
+        return next_revalidation;
     }
 };
 
@@ -941,7 +943,8 @@ test "cache generations revalidate and reclaim old response storage" {
         @intFromPtr(original_generation.snapshot("keep-alive").body.ptr),
     );
 
-    slot.revalidate_after_ms.store(0, .monotonic);
+    slot.revalidate_after_ms = 0;
+    first_view.entries.getPtr(slot.key()).?.revalidate_after_ms = 0;
     var unchanged = (try first_view.tryPrepareEventResponse(
         temporary.dir,
         "index.html",
@@ -967,7 +970,8 @@ test "cache generations revalidate and reclaim old response storage" {
     if (second.lease) |*lease| lease.release();
     const before_refresh = cache.residentBytes(io);
     try temporary.dir.writeFile(io, .{ .sub_path = "index.html", .data = "second-generation" });
-    slot.revalidate_after_ms.store(0, .monotonic);
+    slot.revalidate_after_ms = 0;
+    first_view.entries.getPtr(slot.key()).?.revalidate_after_ms = 0;
 
     var fresh = (try first_view.tryPrepareEventResponse(
         temporary.dir,
