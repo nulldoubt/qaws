@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Rebuilt the memory cache around worker-local views, immutable generations, stat-first per-path refresh, and complete resident-byte accounting.
 - Hardened the allocation-free request parser for Host, framing, body-length, and transfer-encoding validation.
 - Removed access-record, user-agent, peer-formatting, and per-request timing work when access logging is disabled.
 - Removed event hash lookups with pointer userdata, deferred connection destruction, and scheduled one-pass idle scans.

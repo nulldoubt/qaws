@@ -60,6 +60,8 @@ const buildHeaderAlloc = http.buildHeaderAlloc;
 const mimeType = http.mimeType;
 const CachedEventResponse = cache_mod.CachedEventResponse;
 const CachedFileSnapshot = cache_mod.CachedFileSnapshot;
+const CacheLease = cache_mod.CacheLease;
+const CacheView = cache_mod.CacheView;
 const StaticCache = cache_mod.StaticCache;
 const cachedEventResponseFromSnapshot = cache_mod.cachedEventResponseFromSnapshot;
 const SendfileResult = platform.SendfileResult;
@@ -133,6 +135,7 @@ const EventWorkerContext = struct {
     config: Config,
     logger: *Logger,
     cache: *StaticCache,
+    cache_view: ?*CacheView = null,
     queue: ?*WorkerQueue = null,
     listener: ?*Io.net.Server = null,
     active_connections: *std.atomic.Value(u32),
@@ -248,6 +251,7 @@ pub const PendingEventWrite = struct {
     file_buffer_offset: usize = 0,
     file_buffer_len: usize = 0,
     use_sendfile: bool = false,
+    cache_lease: ?CacheLease = null,
     access_enabled: bool = false,
     access_start: Io.Timestamp = undefined,
     access_record: AccessRecord = undefined,
@@ -662,9 +666,11 @@ fn workerLoop(context: *WorkerContext) void {
         return;
     };
     defer root.close(context.io);
+    var cache_view = context.cache.view(context.io);
+    defer cache_view.deinit();
 
     while (context.queue.pop()) |stream| {
-        handleConnection(context.allocator, context.io, root, stream, context.config, context.logger, context.cache) catch |err| {
+        handleConnection(context.allocator, context.io, root, stream, context.config, context.logger, &cache_view) catch |err| {
             if (!isNormalDisconnect(err)) {
                 context.logger.event("error", "connection failed: {s}", .{@errorName(err)}) catch {};
             }
@@ -679,6 +685,10 @@ fn eventWorkerLoop(context: *EventWorkerContext) void {
         return;
     };
     defer root.close(context.io);
+    var cache_view = context.cache.view(context.io);
+    defer cache_view.deinit();
+    context.cache_view = &cache_view;
+    defer context.cache_view = null;
 
     switch (comptime selectRuntimeBackend(builtin.os.tag)) {
         .epoll => eventWorkerLoopEpoll(context, root) catch |err| {
@@ -1346,8 +1356,7 @@ fn prepareEventPath(
     start: Io.Timestamp,
 ) !void {
     const response_connection = if (keep_open) "keep-alive" else "close";
-    const cached = try context.cache.tryPrepareEventResponse(
-        context.io,
+    const cached = try context.cache_view.?.tryPrepareEventResponse(
         root,
         relative_path,
         request.if_modified_since,
@@ -1361,6 +1370,7 @@ fn prepareEventPath(
             .request_end = request_end,
             .served_requests_after = current_request_count,
             .keep_open = keep_open,
+            .cache_lease = response.lease,
         };
         setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, response.status, response.bytes);
         return;
@@ -1734,6 +1744,7 @@ fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection,
 }
 
 fn releasePendingResources(context: *EventWorkerContext, pending: *PendingEventWrite) void {
+    if (pending.cache_lease) |*lease| lease.release();
     if (pending.file) |file| file.close(context.io);
     if (pending.file_buffer) |buffer| context.allocator.free(buffer);
     if (pending.owns_header) context.allocator.free(@constCast(pending.header));
@@ -1787,7 +1798,7 @@ fn sendBusy(io: Io, stream: Io.net.Stream) !void {
     try writer.interface.flush();
 }
 
-fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger, cache: *StaticCache) !void {
+fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.Stream, config: Config, logger: *Logger, cache: *CacheView) !void {
     defer stream.close(io);
 
     var remote_buffer: [128]u8 = undefined;
@@ -1856,7 +1867,7 @@ fn processParsedRequest(
     remote: []const u8,
     config: Config,
     logger: *Logger,
-    cache: *StaticCache,
+    cache: *CacheView,
     current_request_count: u32,
     start: ?Io.Timestamp,
 ) !ProcessRequestResult {
@@ -2035,9 +2046,9 @@ fn servePath(
     connection: []const u8,
     config: Config,
     logger: *Logger,
-    cache: *StaticCache,
+    cache: *CacheView,
 ) !ResponseResult {
-    if (try cache.tryServe(io, root, out, stream_writer, relative_path, if_modified_since, is_head, connection)) |result| {
+    if (try cache.tryServe(root, out, stream_writer, relative_path, if_modified_since, is_head, connection)) |result| {
         return result;
     }
 

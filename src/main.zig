@@ -287,7 +287,7 @@ fn runServeCommand(
     defer logger.deinit();
     try logger.start();
     var cache = StaticCache.init(std.heap.smp_allocator, config);
-    defer cache.deinit();
+    defer cache.deinit(io);
     try serve(std.heap.smp_allocator, io, config, &logger, &cache);
 }
 
