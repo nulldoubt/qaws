@@ -289,7 +289,7 @@ def test_protocol(root, config, port):
             "GET",
             "/app.js",
             200,
-            gzip.compress(b"identity-javascript\n"),
+            (root / "app.js.gz").read_bytes(),
             {"Accept-Encoding": "br;q=0.2, gzip;q=1, identity;q=0.1"},
         )
         expect(gzip_headers["content-encoding"] == "gzip", "gzip q-value was not honored")

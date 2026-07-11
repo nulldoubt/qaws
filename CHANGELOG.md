@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Made precompressed-sidecar integration checks deterministic across slow and fast hosts.
 - Deferred per-response cache generation retention until a socket actually applies backpressure.
 - Reused event-batch time and skipped range selection for ordinary cached requests.
 - Removed global slot-map locking from established worker-local cache hits.
