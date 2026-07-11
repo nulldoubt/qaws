@@ -15,7 +15,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 qaws is currently `0.2.7`.
 
-It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, a cached event-worker fast path for small files, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
+It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, nonblocking event workers on supported Unix platforms, a fixed worker fallback, a generation-based small-file cache, async log writing, resumable platform sendfile, ETags, single byte ranges, precompressed Brotli/gzip sidecars, directory `index.html` resolution, path traversal rejection, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
 ## Usage
 
@@ -45,7 +45,7 @@ Defaults:
 | `--keep-alive-timeout-ms <n>` | `5000` | Idle timeout for persistent connections. |
 | `--max-requests-per-connection <n>` | `1000` | Maximum requests before recycling one persistent connection. |
 | `--max-connections <n>` | `1024` | Maximum active plus queued connections. |
-| `--workers <n>` | logical CPU count | Event-worker count on supported platforms, or fallback worker thread count elsewhere. |
+| `--workers <n>` | automatic CPU topology | Event-worker count on supported platforms, or fallback worker thread count elsewhere. |
 | `--access-log` / `--no-access-log` | access logs on | Enable or disable per-request access logs. |
 | `--pid-file <path>` | derived in daemon mode | PID file for daemon start/status/stop/restart. |
 
@@ -103,12 +103,16 @@ qaws 0.2.7
 - `Connection: close` always closes after the response.
 - HTTP/1.1 pipelined requests are processed sequentially and responses are sent in request order.
 - Requests with bodies are rejected because qaws only serves static files.
+- HTTP/1.1 requests require a nonempty `Host` header. Conflicting body framing and all `Transfer-Encoding` requests are rejected.
 - Directory listings are never generated.
 - There is no SPA fallback. A missing route stays missing.
 - `..`, encoded traversal, NUL bytes, encoded slashes, and backslashes in request paths are rejected.
 - Dotfile path segments are blocked by default, except `.well-known`.
 - Static responses include `X-Content-Type-Options: nosniff`.
 - `Last-Modified` and `If-Modified-Since` are supported, including `304 Not Modified`.
+- Weak representation ETags and `If-None-Match` are supported; ETag validators take precedence over date validators.
+- One normal, open-ended, or suffix byte range is supported for `GET` and `HEAD`, returning `206` or `416` as appropriate.
+- Existing `.br` and `.gz` sidecars can be selected from `Accept-Encoding`; qaws never compresses files at runtime.
 - Custom configured headers can be added, but protected runtime headers are rejected.
 
 Common MIME types are detected for HTML, CSS, JavaScript, JSON, text, SVG, PNG, JPEG, GIF, WebP, ICO, WASM, PDF, XML, WOFF, and WOFF2. Unknown extensions use `application/octet-stream`.
@@ -126,7 +130,7 @@ qaws is deliberately small. Put it behind the right outer layer for anything pub
 
 ## JSON Config
 
-Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`.
+Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`. A complete validated example is available in [`qaws.example.json`](./qaws.example.json).
 
 ```json
 {
@@ -147,10 +151,13 @@ Config is explicit. qaws does not auto-load `qaws.json`; pass it with `--config`
     "trailing_slash_redirect": true,
     "keep_alive": true,
     "sendfile": true,
+    "etag": true,
+    "range_requests": true,
+    "precompressed": true,
     "keep_alive_timeout_ms": 5000,
     "max_requests_per_connection": 1000,
     "max_connections": 1024,
-    "workers": 4
+    "workers": null
   }
 }
 ```
@@ -167,13 +174,17 @@ Validate config and the serve directory:
 qaws check --config qaws.json
 ```
 
+`"workers": null` keeps automatic CPU-topology selection. Set a positive integer to override it.
+
+Custom headers cannot replace qaws-owned framing or representation headers: `Content-Length`, `Content-Type`, `Connection`, `Server`, `Allow`, `Location`, `ETag`, `Accept-Ranges`, `Content-Range`, `Content-Encoding`, and `Vary` are protected.
+
 Boolean flags are available as pairs when a config file may need to be overridden from the command line. For example, `--no-access-log` disables the default access log, while `--access-log` re-enables it when a config file sets `"access": false`. The same pattern applies to `--keep-alive` and `--no-keep-alive`.
 
 ## Static Cache
 
-qaws caches small static files by default. The cache stores file bodies up to `256 KiB`, keeps at most `16 MiB` of active cached bodies, prebuilds common response headers, and revalidates cached files after `1000` ms. When the total cache limit is reached, additional files are served through the normal uncached path instead of evicting existing entries.
+qaws caches small static files by default. Each worker keeps a local view of shared immutable cache generations, so normal cached hits do not serialize behind one global response lock. The cache stores file bodies up to `256 KiB`, accounts for path/header/body storage and live old generations within its `16 MiB` default limit, and revalidates entries after `1000` ms.
 
-On evented platforms, cached safe-path `GET`, `HEAD`, and `304` responses use a nonblocking event-worker fast path. The worker writes prebuilt headers and cached bodies from pending output state, then continues with the next pipelined request only after the current response is fully sent. Complex paths, redirects, errors, uncached files, and large sendfile responses keep using the normal response path.
+Revalidation stats the file first. An unchanged size and nanosecond mtime extend the entry lifetime without rereading the body; a changed file creates a new generation while in-flight responses retain the old one safely. Identity, Brotli, and gzip representations have distinct cache keys and ETags. When the memory limit is reached, additional files are served uncached instead of evicting existing entries.
 
 Cache settings are JSON-only in `0.2.7`:
 
@@ -204,18 +215,63 @@ qaws uses persistent HTTP connections by default:
 - On Linux and Android, qaws uses `epoll` event workers.
 - On macOS and FreeBSD, qaws uses `kqueue` event workers.
 - Unsupported targets keep the fixed blocking worker-pool backend.
-- `--workers` controls the event-worker count on evented platforms, or the fallback worker count elsewhere. The default is the detected logical CPU count, falling back to `1`.
-- Cached event-worker responses are written without switching the socket into the blocking response path.
+- `--workers` controls the event-worker count on evented platforms, or the fallback worker count elsewhere.
+- Automatic worker selection uses the highest-capacity CPU cluster on Linux/Android, `hw.perflevel0.logicalcpu` on macOS, and logical CPU count with a fallback of `1` elsewhere.
+- Event workers own `SO_REUSEPORT` listeners where supported. qaws automatically falls back to the main-thread dispatcher when multi-listener setup is unavailable.
+- Cached memory responses, buffered files, and sendfile bodies all use resumable pending output state without blocking-mode socket toggles.
+- Read readiness is paused while a response is pending, preserving ordered pipelining and bounding per-connection buffering.
 - Each event tick processes a small bounded batch of ready cached requests internally, so pipelined clients cannot monopolize a worker indefinitely.
 - The server accepts up to `1024` active plus queued connections by default.
 - When the connection cap is reached, qaws returns `503 Service Unavailable` with `Connection: close`.
 - HTTP/1.1 pipelined requests on one connection are served sequentially in request order.
 
-These defaults stay usable on Termux and small VPS machines while avoiding per-connection thread creation overhead. Startup logs include the selected backend, such as `using kqueue`, `using epoll`, or `using worker`.
+These defaults stay usable on Termux and asymmetric ARM systems while avoiding per-connection thread creation overhead. Startup logs include the internally selected backend, such as `using kqueue`, `using epoll`, or `using worker`; there is no public backend selector.
+
+## Conditional Requests And Ranges
+
+qaws emits both `Last-Modified` and a weak representation ETag by default. `If-None-Match` takes precedence over `If-Modified-Since`, including the `*` form:
+
+```sh
+curl -i http://127.0.0.1:18086/
+curl -i -H 'If-None-Match: W/"..."' http://127.0.0.1:18086/
+```
+
+One byte range is supported. Ranges address the selected identity, gzip, or Brotli representation:
+
+```sh
+curl -i -H 'Range: bytes=0-1023' http://127.0.0.1:18086/large.bin
+curl -i -H 'Range: bytes=-512' http://127.0.0.1:18086/large.bin
+```
+
+Valid multipart range sets are ignored and served as a normal `200`; malformed or unsatisfiable single ranges return `416`. Date-based `If-Range` is supported. Weak ETags do not strongly satisfy `If-Range`.
+
+Disable these features independently in strict JSON config:
+
+```json
+{ "http": { "etag": false, "range_requests": false } }
+```
+
+## Precompressed Sidecars
+
+When `http.precompressed` is enabled, a request for `app.js` may use `app.js.br` or `app.js.gz` if that sidecar exists and the client accepts it. Brotli wins over gzip, then identity, when qualities are equal. A request that rejects every available representation receives `406 Not Acceptable`.
+
+```sh
+brotli -f public/app.js
+gzip -k public/app.js
+curl -i --raw -H 'Accept-Encoding: br, gzip' http://127.0.0.1:18086/app.js
+```
+
+The response keeps the original path's MIME type and adds `Content-Encoding` plus `Vary: Accept-Encoding`. Metadata, ETags, conditional requests, cache entries, and ranges describe the selected sidecar bytes. Direct requests for `.br` or `.gz` files are served normally without recursive negotiation.
+
+Disable sidecar negotiation with:
+
+```json
+{ "http": { "precompressed": false } }
+```
 
 ## Sendfile
 
-qaws uses platform sendfile by default for uncached regular-file `GET` responses on supported Unix targets. Headers are still written through the normal response writer, then qaws flushes those headers and sends the file body through the platform file-transfer path. Cached small files keep using the in-memory cache, and `HEAD`, `304`, redirects, and errors do not use sendfile.
+qaws uses platform sendfile by default for uncached regular-file `GET` responses on supported Unix targets. Headers are written first, then event workers resume partial sendfile progress after write readiness without blocking the worker on a slow client. Cached small files keep using the in-memory cache, and `HEAD`, `304`, redirects, and errors do not use sendfile.
 
 Disable sendfile for comparison or troubleshooting:
 
@@ -339,6 +395,12 @@ Run unit tests:
 ```sh
 zig test src/main.zig
 zig build test
+```
+
+Check release-facing version metadata explicitly:
+
+```sh
+zig build check-version
 ```
 
 Run from the build system:
@@ -532,9 +594,17 @@ wrk -t4 -c16 -d30s http://127.0.0.1:18086/sixty-four-mib.bin
 
 To stress idle keep-alive handling, hold many sockets open while running an active benchmark. The event backend should continue serving active requests while idle clients wait for `keep_alive_timeout_ms`.
 
+Use conditional, range, and sidecar requests as diagnostics rather than comparing only `/`:
+
+```sh
+curl -sS -o /dev/null -D - -H 'If-None-Match: W/"..."' http://127.0.0.1:18086/
+curl -sS -o /dev/null -D - -H 'Range: bytes=0-1048575' http://127.0.0.1:18086/sixty-four-mib.bin
+curl -sS --raw -o /dev/null -D - -H 'Accept-Encoding: br, gzip' http://127.0.0.1:18086/app.js
+```
+
 ## Roadmap
 
-Future performance releases may make large response bodies fully resumable in nonblocking event workers, add io_uring or IOCP where practical, and improve cache behavior with eviction, full-response blobs, file descriptor caching, and watcher-based invalidation.
+Future performance releases may add io_uring or IOCP where practical and improve cache behavior with bounded eviction, file descriptor caching, and watcher-based invalidation. Runtime compression, multipart ranges, TLS, authentication, directory listing, SPA fallback, and worker affinity remain outside `0.2.7`.
 
 ## License
 

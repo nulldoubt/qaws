@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Documented modern validators, ranges, sidecar negotiation, topology-aware workers, and resumable event transfers.
 - Added a complete example JSON configuration and an automated release-version consistency check.
 - Added Brotli/gzip sidecar negotiation with q-values, variant cache keys and ETags, encoded ranges, and `406` handling.
 - Added configurable single byte ranges with `206`, `416`, suffix/open forms, date `If-Range`, and cached/sendfile support.

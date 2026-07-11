@@ -860,7 +860,7 @@ fn printHelp() !void {
         \\  --serve ./public
         \\
         \\Options:
-        \\  --config <path>
+        \\  --config <path> (strict JSON; see qaws.example.json)
         \\  --log-format plain|jsonl
         \\  --log-file <path>
         \\  --pid-file <path>
