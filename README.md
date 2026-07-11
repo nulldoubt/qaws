@@ -397,6 +397,14 @@ zig test src/main.zig
 zig build test
 ```
 
+Run the end-to-end protocol, pipeline, cache, fallback, overload, and daemon suite:
+
+```sh
+zig build integration
+```
+
+The integration suite uses Python's standard library only and starts the freshly built native qaws binary on temporary loopback ports.
+
 Check release-facing version metadata explicitly:
 
 ```sh

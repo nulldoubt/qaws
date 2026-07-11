@@ -56,6 +56,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
 
+    const integration_cmd = b.addSystemCommand(&.{ "python3", "tests/integration.py", "zig-out/bin/qaws" });
+    integration_cmd.step.dependOn(b.getInstallStep());
+    const integration_step = b.step("integration", "Run end-to-end HTTP and daemon integration tests");
+    integration_step.dependOn(&integration_cmd.step);
+
     const release_step = b.step("release", "Build release binaries into the install prefix's dist/ directory");
     for (release_targets) |spec| {
         const release_target = b.resolveTargetQuery(

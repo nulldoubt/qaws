@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Added repeatable end-to-end coverage for strict HTTP, 64-request pipelines, partial writes, cache refresh, overload, fallbacks, and daemon control.
 - Documented modern validators, ranges, sidecar negotiation, topology-aware workers, and resumable event transfers.
 - Added a complete example JSON configuration and an automated release-version consistency check.
 - Added Brotli/gzip sidecar negotiation with q-values, variant cache keys and ETags, encoded ranges, and `406` handling.
