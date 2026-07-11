@@ -373,11 +373,39 @@ pub const CacheView = struct {
         is_head: bool,
         connection: []const u8,
     ) !?CachedEventResponse {
+        return self.prepareAt(
+            root,
+            logical_path,
+            physical_path,
+            representation,
+            if_none_match,
+            if_modified_since,
+            range_value,
+            if_range,
+            is_head,
+            connection,
+            Io.Timestamp.now(self.io, .awake),
+        );
+    }
+
+    pub fn prepareAt(
+        self: *CacheView,
+        root: Io.Dir,
+        logical_path: []const u8,
+        physical_path: []const u8,
+        representation: Representation,
+        if_none_match: ?[]const u8,
+        if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+        now: Io.Timestamp,
+    ) !?CachedEventResponse {
         if (!self.cache.enabled) return null;
         const entry = try self.getOrCreateViewEntry(logical_path, physical_path, representation) orelse return null;
         const slot = entry.slot;
 
-        const now = Io.Timestamp.now(self.io, .awake);
         const now_ms = timestampMilliseconds(now);
         if (now_ms >= slot.revalidate_after_ms.load(.monotonic)) {
             try self.refresh(root, slot, now, now_ms);
@@ -395,7 +423,7 @@ pub const CacheView = struct {
             if_modified_since,
             is_head,
         );
-        if (response.status == 200 and self.cache.range_requests and http.ifRangeAllows(if_range, generation.mtime_sec)) {
+        if (response.status == 200 and self.cache.range_requests and range_value != null and http.ifRangeAllows(if_range, generation.mtime_sec)) {
             response = try self.rangeResponse(
                 generation.snapshot(connection),
                 logical_path,

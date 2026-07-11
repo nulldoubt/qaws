@@ -1571,7 +1571,7 @@ fn prepareEventPath(
         },
     };
 
-    const cached = try context.cache_view.?.prepare(
+    const cached = try context.cache_view.?.prepareAt(
         root,
         relative_path,
         choice.physical_path,
@@ -1582,6 +1582,7 @@ fn prepareEventPath(
         request.if_range,
         is_head,
         response_connection,
+        start,
     );
     if (cached) |response| {
         conn.pending = .{

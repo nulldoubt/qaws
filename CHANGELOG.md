@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Reused event-batch time and skipped range selection for ordinary cached requests.
 - Removed global slot-map locking from established worker-local cache hits.
 - Added repeatable end-to-end coverage for strict HTTP, 64-request pipelines, partial writes, cache refresh, overload, fallbacks, and daemon control.
 - Documented modern validators, ranges, sidecar negotiation, topology-aware workers, and resumable event transfers.
