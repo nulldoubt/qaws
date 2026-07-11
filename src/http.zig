@@ -41,6 +41,17 @@ pub const ResponseResult = struct {
     bytes: u64,
 };
 
+pub const ResponseHeaderOptions = struct {
+    allow: ?[]const u8 = null,
+    last_modified: ?[]const u8 = null,
+    location: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
+    accept_ranges: bool = false,
+    content_range: ?[]const u8 = null,
+    content_encoding: ?[]const u8 = null,
+    vary_accept_encoding: bool = false,
+};
+
 pub fn parseRequest(bytes: []const u8) !Request {
     return parseRequestOptions(bytes, true);
 }
@@ -326,6 +337,52 @@ pub fn parseHttpDate(value: []const u8) ?i64 {
     return @intCast(total);
 }
 
+pub fn formatWeakEtag(
+    mtime_ns: i96,
+    size: u64,
+    variant: []const u8,
+    buffer: []u8,
+) []const u8 {
+    var writer: Io.Writer = .fixed(buffer);
+    writer.print("W/\"{x}-{x}-{s}\"", .{ mtime_ns, size, variant }) catch return "";
+    return writer.buffered();
+}
+
+pub fn ifNoneMatchMatches(value: []const u8, etag: []const u8) bool {
+    var candidates = std.mem.splitScalar(u8, value, ',');
+    while (candidates.next()) |raw| {
+        const candidate = std.mem.trim(u8, raw, " \t");
+        if (std.mem.eql(u8, candidate, "*")) return true;
+        if (std.mem.eql(u8, weakEtagValue(candidate), weakEtagValue(etag))) return true;
+    }
+    return false;
+}
+
+pub fn isNotModified(
+    if_none_match: ?[]const u8,
+    if_modified_since: ?[]const u8,
+    etag: ?[]const u8,
+    mtime_sec: i64,
+    last_modified_enabled: bool,
+) bool {
+    if (if_none_match) |value| {
+        const current = etag orelse return false;
+        return ifNoneMatchMatches(value, current);
+    }
+    if (!last_modified_enabled) return false;
+    if (if_modified_since) |value| {
+        if (parseHttpDate(value)) |since| return since >= mtime_sec;
+    }
+    return false;
+}
+
+fn weakEtagValue(value: []const u8) []const u8 {
+    if (value.len >= 2 and (value[0] == 'W' or value[0] == 'w') and value[1] == '/') {
+        return value[2..];
+    }
+    return value;
+}
+
 fn parseHttpMonth(value: []const u8) ?u8 {
     const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     for (names, 1..) |name, month| {
@@ -362,15 +419,40 @@ pub fn sendHeaders(
     last_modified: ?[]const u8,
     location: ?[]const u8,
 ) !void {
+    return sendHeadersExtended(
+        out,
+        status,
+        content_type,
+        content_length,
+        connection,
+        extra_headers,
+        .{ .allow = allow, .last_modified = last_modified, .location = location },
+    );
+}
+
+pub fn sendHeadersExtended(
+    out: *Io.Writer,
+    status: ResponseStatus,
+    content_type: []const u8,
+    content_length: u64,
+    connection: []const u8,
+    extra_headers: []const config_mod.Header,
+    options: ResponseHeaderOptions,
+) !void {
     try out.print("HTTP/1.1 {d} {s}\r\n", .{ status.code, status.reason });
     try out.print("Server: {s}\r\n", .{server_name});
     try out.print("Content-Type: {s}\r\n", .{content_type});
     try out.print("Content-Length: {d}\r\n", .{content_length});
     try out.print("Connection: {s}\r\n", .{connection});
     try out.writeAll("X-Content-Type-Options: nosniff\r\n");
-    if (allow) |value| try out.print("Allow: {s}\r\n", .{value});
-    if (last_modified) |value| try out.print("Last-Modified: {s}\r\n", .{value});
-    if (location) |value| try out.print("Location: {s}\r\n", .{value});
+    if (options.allow) |value| try out.print("Allow: {s}\r\n", .{value});
+    if (options.last_modified) |value| try out.print("Last-Modified: {s}\r\n", .{value});
+    if (options.location) |value| try out.print("Location: {s}\r\n", .{value});
+    if (options.etag) |value| try out.print("ETag: {s}\r\n", .{value});
+    if (options.accept_ranges) try out.writeAll("Accept-Ranges: bytes\r\n");
+    if (options.content_range) |value| try out.print("Content-Range: {s}\r\n", .{value});
+    if (options.content_encoding) |value| try out.print("Content-Encoding: {s}\r\n", .{value});
+    if (options.vary_accept_encoding) try out.writeAll("Vary: Accept-Encoding\r\n");
     for (extra_headers) |header| try out.print("{s}: {s}\r\n", .{ header.name, header.value });
     try out.writeAll("\r\n");
 }
@@ -386,6 +468,26 @@ pub fn buildHeaderAlloc(
     last_modified: ?[]const u8,
     location: ?[]const u8,
 ) ![]u8 {
+    return buildHeaderAllocExtended(
+        allocator,
+        status,
+        content_type,
+        content_length,
+        connection,
+        extra_headers,
+        .{ .allow = allow, .last_modified = last_modified, .location = location },
+    );
+}
+
+pub fn buildHeaderAllocExtended(
+    allocator: Allocator,
+    status: ResponseStatus,
+    content_type: []const u8,
+    content_length: u64,
+    connection: []const u8,
+    extra_headers: []const config_mod.Header,
+    options: ResponseHeaderOptions,
+) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
     try output.print(allocator, "HTTP/1.1 {d} {s}\r\n", .{ status.code, status.reason });
@@ -394,9 +496,14 @@ pub fn buildHeaderAlloc(
     try output.print(allocator, "Content-Length: {d}\r\n", .{content_length});
     try output.print(allocator, "Connection: {s}\r\n", .{connection});
     try output.appendSlice(allocator, "X-Content-Type-Options: nosniff\r\n");
-    if (allow) |value| try output.print(allocator, "Allow: {s}\r\n", .{value});
-    if (last_modified) |value| try output.print(allocator, "Last-Modified: {s}\r\n", .{value});
-    if (location) |value| try output.print(allocator, "Location: {s}\r\n", .{value});
+    if (options.allow) |value| try output.print(allocator, "Allow: {s}\r\n", .{value});
+    if (options.last_modified) |value| try output.print(allocator, "Last-Modified: {s}\r\n", .{value});
+    if (options.location) |value| try output.print(allocator, "Location: {s}\r\n", .{value});
+    if (options.etag) |value| try output.print(allocator, "ETag: {s}\r\n", .{value});
+    if (options.accept_ranges) try output.appendSlice(allocator, "Accept-Ranges: bytes\r\n");
+    if (options.content_range) |value| try output.print(allocator, "Content-Range: {s}\r\n", .{value});
+    if (options.content_encoding) |value| try output.print(allocator, "Content-Encoding: {s}\r\n", .{value});
+    if (options.vary_accept_encoding) try output.appendSlice(allocator, "Vary: Accept-Encoding\r\n");
     for (extra_headers) |header| try output.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
     try output.appendSlice(allocator, "\r\n");
     return try output.toOwnedSlice(allocator);

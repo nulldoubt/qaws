@@ -56,8 +56,12 @@ const slashRedirectLocation = http.slashRedirectLocation;
 const formatHttpDate = http.formatHttpDate;
 const parseHttpDate = http.parseHttpDate;
 const sendHeaders = http.sendHeaders;
+const sendHeadersExtended = http.sendHeadersExtended;
 const buildHeaderAlloc = http.buildHeaderAlloc;
+const buildHeaderAllocExtended = http.buildHeaderAllocExtended;
 const mimeType = http.mimeType;
+const formatWeakEtag = http.formatWeakEtag;
+const isNotModified = http.isNotModified;
 const CachedEventResponse = cache_mod.CachedEventResponse;
 const CachedFileSnapshot = cache_mod.CachedFileSnapshot;
 const CacheLease = cache_mod.CacheLease;
@@ -1139,6 +1143,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                     &.{},
                     null,
                     null,
+                    null,
                 );
                 return flushEventPendingWrite(context, conn, batch_now);
             }
@@ -1180,6 +1185,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                 &.{},
                 null,
                 null,
+                null,
             );
             return flushEventPendingWrite(context, conn, batch_now);
         };
@@ -1217,6 +1223,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
             true,
             null,
             &.{},
+            null,
             null,
             null,
         );
@@ -1272,6 +1279,7 @@ fn prepareEventResponse(
             &.{},
             null,
             null,
+            null,
         );
         return;
     }
@@ -1295,6 +1303,7 @@ fn prepareEventResponse(
             true,
             "GET, HEAD",
             &.{},
+            null,
             null,
             null,
         );
@@ -1321,6 +1330,7 @@ fn prepareEventResponse(
                 !is_head,
                 null,
                 &.{},
+                null,
                 null,
                 null,
             );
@@ -1359,6 +1369,7 @@ fn prepareEventPath(
     const cached = try context.cache_view.?.tryPrepareEventResponse(
         root,
         relative_path,
+        request.if_none_match,
         request.if_modified_since,
         is_head,
         response_connection,
@@ -1400,6 +1411,7 @@ fn prepareEventPath(
                 &.{},
                 null,
                 null,
+                null,
             );
             return;
         },
@@ -1423,6 +1435,7 @@ fn prepareEventPath(
                     !is_head,
                     null,
                     context.config.headers,
+                    null,
                     null,
                     location,
                 );
@@ -1462,6 +1475,7 @@ fn prepareEventPath(
                 &.{},
                 null,
                 null,
+                null,
             );
             return;
         },
@@ -1492,6 +1506,7 @@ fn prepareEventPath(
             &.{},
             null,
             null,
+            null,
         );
         return;
     }
@@ -1499,47 +1514,42 @@ fn prepareEventPath(
     const content_type = mimeType(relative_path);
     var last_modified_buffer: [64]u8 = undefined;
     const last_modified = if (context.config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
-    if (context.config.last_modified) {
-        if (request.if_modified_since) |value| {
-            if (parseHttpDate(value)) |since| {
-                if (since >= stat.mtime.toSeconds()) {
-                    file.close(context.io);
-                    file_owned = false;
-                    try queueEventMemoryResponse(
-                        context,
-                        conn,
-                        request_end,
-                        current_request_count,
-                        keep_open,
-                        start,
-                        request.method,
-                        request.target,
-                        request.user_agent,
-                        .{ .code = 304, .reason = "Not Modified" },
-                        content_type,
-                        "",
-                        false,
-                        null,
-                        context.config.headers,
-                        last_modified,
-                        null,
-                    );
-                    return;
-                }
-            }
-        }
+    var etag_buffer: [128]u8 = undefined;
+    const etag = if (context.config.etag) formatWeakEtag(stat.mtime.nanoseconds, stat.size, "identity", &etag_buffer) else null;
+    if (isNotModified(request.if_none_match, request.if_modified_since, etag, stat.mtime.toSeconds(), context.config.last_modified)) {
+        file.close(context.io);
+        file_owned = false;
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            request_end,
+            current_request_count,
+            keep_open,
+            start,
+            request.method,
+            request.target,
+            request.user_agent,
+            .{ .code = 304, .reason = "Not Modified" },
+            content_type,
+            "",
+            false,
+            null,
+            context.config.headers,
+            last_modified,
+            etag,
+            null,
+        );
+        return;
     }
 
-    const header = try buildHeaderAlloc(
+    const header = try buildHeaderAllocExtended(
         context.allocator,
         .{ .code = 200, .reason = "OK" },
         content_type,
         stat.size,
         response_connection,
-        null,
         context.config.headers,
-        last_modified,
-        null,
+        .{ .last_modified = last_modified, .etag = etag },
     );
     errdefer context.allocator.free(header);
 
@@ -1578,19 +1588,18 @@ fn queueEventMemoryResponse(
     allow: ?[]const u8,
     extra_headers: []const Header,
     last_modified: ?[]const u8,
+    etag: ?[]const u8,
     location: ?[]const u8,
 ) !void {
     const connection = if (keep_open) "keep-alive" else "close";
-    const header = try buildHeaderAlloc(
+    const header = try buildHeaderAllocExtended(
         context.allocator,
         status,
         content_type,
         body.len,
         connection,
-        allow,
         extra_headers,
-        last_modified,
-        location,
+        .{ .allow = allow, .last_modified = last_modified, .etag = etag, .location = location },
     );
     conn.pending = .{
         .header = header,
@@ -1910,6 +1919,7 @@ fn processParsedRequest(
         stream_writer,
         relative_path,
         request.target,
+        request.if_none_match,
         request.if_modified_since,
         is_head,
         response_connection,
@@ -2041,6 +2051,7 @@ fn servePath(
     stream_writer: *Io.net.Stream.Writer,
     relative_path: []const u8,
     request_target: []const u8,
+    if_none_match: ?[]const u8,
     if_modified_since: ?[]const u8,
     is_head: bool,
     connection: []const u8,
@@ -2048,7 +2059,7 @@ fn servePath(
     logger: *Logger,
     cache: *CacheView,
 ) !ResponseResult {
-    if (try cache.tryServe(root, out, stream_writer, relative_path, if_modified_since, is_head, connection)) |result| {
+    if (try cache.tryServe(root, out, stream_writer, relative_path, if_none_match, if_modified_since, is_head, connection)) |result| {
         return result;
     }
 
@@ -2066,7 +2077,7 @@ fn servePath(
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_modified_since, is_head, connection, config, logger, cache);
+            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, is_head, connection, config, logger, cache);
         },
         error.AccessDenied => {
             return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
@@ -2083,29 +2094,31 @@ fn servePath(
     const content_type = mimeType(relative_path);
     var last_modified_buffer: [64]u8 = undefined;
     const last_modified = if (config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
-    if (config.last_modified) {
-        if (if_modified_since) |value| {
-            if (parseHttpDate(value)) |since| {
-                if (since >= stat.mtime.toSeconds()) {
-                    try sendHeaders(
-                        out,
-                        .{ .code = 304, .reason = "Not Modified" },
-                        content_type,
-                        0,
-                        connection,
-                        null,
-                        config.headers,
-                        last_modified,
-                        null,
-                    );
-                    try stream_writer.interface.flush();
-                    return .{ .status = 304, .bytes = 0 };
-                }
-            }
-        }
+    var etag_buffer: [128]u8 = undefined;
+    const etag = if (config.etag) formatWeakEtag(stat.mtime.nanoseconds, stat.size, "identity", &etag_buffer) else null;
+    if (isNotModified(if_none_match, if_modified_since, etag, stat.mtime.toSeconds(), config.last_modified)) {
+        try sendHeadersExtended(
+            out,
+            .{ .code = 304, .reason = "Not Modified" },
+            content_type,
+            0,
+            connection,
+            config.headers,
+            .{ .last_modified = last_modified, .etag = etag },
+        );
+        try stream_writer.interface.flush();
+        return .{ .status = 304, .bytes = 0 };
     }
 
-    try sendHeaders(out, .{ .code = 200, .reason = "OK" }, content_type, stat.size, connection, null, config.headers, last_modified, null);
+    try sendHeadersExtended(
+        out,
+        .{ .code = 200, .reason = "OK" },
+        content_type,
+        stat.size,
+        connection,
+        config.headers,
+        .{ .last_modified = last_modified, .etag = etag },
+    );
     if (!is_head) {
         try sendFileBody(io, stream, out, stream_writer, file, stat.size, config, logger);
     }

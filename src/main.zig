@@ -102,6 +102,9 @@ const targetPathHasTrailingSlash = http.targetPathHasTrailingSlash;
 const slashRedirectLocation = http.slashRedirectLocation;
 const formatHttpDate = http.formatHttpDate;
 const parseHttpDate = http.parseHttpDate;
+const formatWeakEtag = http.formatWeakEtag;
+const ifNoneMatchMatches = http.ifNoneMatchMatches;
+const isNotModified = http.isNotModified;
 const sendHeaders = http.sendHeaders;
 const buildHeaderAlloc = http.buildHeaderAlloc;
 const mimeType = http.mimeType;
@@ -1188,19 +1191,19 @@ test "cached event response selection handles GET HEAD and 304" {
         .response_200 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\nBismillah.",
     };
 
-    const get = cachedEventResponseFromSnapshot(true, cached, null, false);
+    const get = cachedEventResponseFromSnapshot(true, cached, null, null, false);
     try std.testing.expectEqual(@as(u16, 200), get.status);
     try std.testing.expectEqual(@as(u64, 10), get.bytes);
     try std.testing.expectEqualStrings(cached.response_200, get.header);
     try std.testing.expectEqual(@as(usize, 0), get.body.len);
 
-    const head = cachedEventResponseFromSnapshot(true, cached, null, true);
+    const head = cachedEventResponseFromSnapshot(true, cached, null, null, true);
     try std.testing.expectEqual(@as(u16, 200), head.status);
     try std.testing.expectEqual(@as(u64, 0), head.bytes);
     try std.testing.expectEqualStrings(cached.header_200, head.header);
     try std.testing.expectEqual(@as(usize, 0), head.body.len);
 
-    const not_modified = cachedEventResponseFromSnapshot(true, cached, "Thu, 01 Jan 1970 00:00:00 GMT", false);
+    const not_modified = cachedEventResponseFromSnapshot(true, cached, null, "Thu, 01 Jan 1970 00:00:00 GMT", false);
     try std.testing.expectEqual(@as(u16, 304), not_modified.status);
     try std.testing.expectEqual(@as(u64, 0), not_modified.bytes);
     try std.testing.expectEqualStrings(cached.header_304, not_modified.header);
@@ -1467,6 +1470,7 @@ test "json config applies values and cli overrides" {
         \\    "trailing_slash_redirect": false,
         \\    "keep_alive": false,
         \\    "sendfile": false,
+        \\    "etag": false,
         \\    "keep_alive_timeout_ms": 2000,
         \\    "max_requests_per_connection": 100,
         \\    "max_connections": 64,
@@ -1499,6 +1503,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expect(!config.trailing_slash_redirect);
     try std.testing.expect(!config.keep_alive);
     try std.testing.expect(!config.sendfile);
+    try std.testing.expect(!config.etag);
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
@@ -1554,6 +1559,15 @@ test "json config rejects unknown keys and invalid headers" {
     });
     defer protected.deinit();
     try std.testing.expectError(error.ProtectedHeader, applyFileConfig(allocator, protected.value, &config));
+
+    const protected_modern = [_][]const u8{ "ETag", "Accept-Ranges", "Content-Range", "Content-Encoding", "Vary" };
+    for (protected_modern) |name| {
+        const document = try std.fmt.allocPrint(allocator, "{{ \"headers\": {{ \"{s}\": \"value\" }} }}", .{name});
+        defer allocator.free(document);
+        var parsed_header = try std.json.parseFromSlice(FileConfig, allocator, document, .{ .ignore_unknown_fields = false });
+        defer parsed_header.deinit();
+        try std.testing.expectError(error.ProtectedHeader, applyFileConfig(allocator, parsed_header.value, &config));
+    }
 }
 
 test "json config rejects invalid http limits" {
@@ -1674,6 +1688,18 @@ test "http date parsing and slash redirect locations" {
     try std.testing.expectEqualStrings("/docs/?x=1", redirected);
     try std.testing.expect(!targetPathHasTrailingSlash("/docs?x=1"));
     try std.testing.expect(targetPathHasTrailingSlash("/docs/?x=1"));
+}
+
+test "weak etags and conditional precedence follow HTTP rules" {
+    var buffer: [128]u8 = undefined;
+    const etag = formatWeakEtag(0xff, 0x10, "identity", &buffer);
+    try std.testing.expectEqualStrings("W/\"ff-10-identity\"", etag);
+    try std.testing.expect(ifNoneMatchMatches("*", etag));
+    try std.testing.expect(ifNoneMatchMatches("\"other\", \"ff-10-identity\"", etag));
+    try std.testing.expect(!ifNoneMatchMatches("W/\"different\"", etag));
+    try std.testing.expect(isNotModified(etag, "Thu, 01 Jan 1970 00:00:00 GMT", etag, 0, true));
+    try std.testing.expect(!isNotModified("W/\"different\"", "Thu, 01 Jan 2100 00:00:00 GMT", etag, 0, true));
+    try std.testing.expect(isNotModified(null, "Thu, 01 Jan 1970 00:00:00 GMT", etag, 0, true));
 }
 
 test "runtime path component sanitization" {
