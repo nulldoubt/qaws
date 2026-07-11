@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Split static cache ownership, snapshots, and prebuilt responses into a focused Zig module.
 - Split HTTP parsing, normalization, date handling, MIME detection, and header generation into a focused Zig module.
 - Centralized compiled version metadata for the executable and build system.
 - Split asynchronous logging, access records, and log queues into a focused Zig module.
