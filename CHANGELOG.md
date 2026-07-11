@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Made cached, memory, buffered-file, and sendfile event responses fully resumable without blocking-mode socket toggles.
 - Moved accepting into bounded nonblocking per-worker `SO_REUSEPORT` listeners with automatic dispatcher fallback.
 - Selected automatic workers from the highest-capacity CPU cluster with portable logical-CPU fallback.
 - Split worker queues, connection handling, event loops, and static response serving into a focused Zig module.

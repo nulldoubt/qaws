@@ -1174,7 +1174,7 @@ test "event backend timeout helpers cap wait and detect fresh connections" {
         .header = "HTTP/1.1 200 OK\r\n\r\n",
         .request_end = 1,
     };
-    try std.testing.expect(!eventConnectionExpired(&pending_conn, now.addDuration(Io.Duration.fromMilliseconds(5000)), .{ .keep_alive_timeout_ms = 1 }));
+    try std.testing.expect(eventConnectionExpired(&pending_conn, now.addDuration(Io.Duration.fromMilliseconds(5000)), .{ .keep_alive_timeout_ms = 1 }));
 }
 
 test "cached event response selection handles GET HEAD and 304" {

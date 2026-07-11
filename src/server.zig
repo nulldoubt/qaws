@@ -86,9 +86,11 @@ const epollWait = platform.epollWait;
 const kqueueCreate = platform.kqueueCreate;
 const kqueueAdd = platform.kqueueAdd;
 const kqueueSetWriteInterest = platform.kqueueSetWriteInterest;
+const kqueueSetReadInterest = platform.kqueueSetReadInterest;
 const kqueueWait = platform.kqueueWait;
 const sendfileSupportedForOs = platform.sendfileSupportedForOs;
 const trySendfile = platform.trySendfile;
+const trySendfileStep = platform.trySendfileStep;
 
 pub const FileTransferPath = enum {
     none,
@@ -158,6 +160,15 @@ pub const PendingEventWrite = struct {
     request_end: usize = 0,
     served_requests_after: u32 = 0,
     keep_open: bool = false,
+    owns_header: bool = false,
+    owns_body: bool = false,
+    file: ?Io.File = null,
+    file_offset: u64 = 0,
+    file_remaining: u64 = 0,
+    file_buffer: ?[]u8 = null,
+    file_buffer_offset: usize = 0,
+    file_buffer_len: usize = 0,
+    use_sendfile: bool = false,
     access_start: Io.Timestamp = undefined,
     access_record: AccessRecord = undefined,
 
@@ -166,7 +177,10 @@ pub const PendingEventWrite = struct {
     }
 
     pub fn complete(self: *const PendingEventWrite) bool {
-        return self.header_offset >= self.header.len and self.body_offset >= self.body.len;
+        return self.header_offset >= self.header.len and
+            self.body_offset >= self.body.len and
+            self.file_remaining == 0 and
+            self.file_buffer_offset >= self.file_buffer_len;
     }
 };
 
@@ -863,6 +877,7 @@ fn createEventConnection(context: *EventWorkerContext, stream: Io.net.Stream) !*
 }
 
 fn destroyEventConnection(context: *EventWorkerContext, conn: *EventConnection) void {
+    releasePendingResources(context, &conn.pending);
     conn.stream.close(context.io);
     releaseConnection(context.active_connections);
     context.allocator.destroy(conn);
@@ -908,7 +923,6 @@ fn closeExpiredEventConnections(
 }
 
 pub fn eventConnectionExpired(conn: *const EventConnection, now: Io.Timestamp, config: Config) bool {
-    if (conn.hasPendingWrite()) return false;
     const idle_ms = conn.last_active.durationTo(now).toMilliseconds();
     return idle_ms >= config.keep_alive_timeout_ms;
 }
@@ -919,8 +933,26 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
     while (true) {
         if (conn.request_len == conn.request_buffer.len) {
             if (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n") == null) {
-                try sendEventRequestError(context, root, conn, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n");
-                return false;
+                try queueEventMemoryResponse(
+                    context,
+                    conn,
+                    conn.request_len,
+                    conn.served_requests,
+                    false,
+                    Io.Timestamp.now(context.io, .awake),
+                    "-",
+                    "-",
+                    null,
+                    .{ .code = 413, .reason = "Payload Too Large" },
+                    "text/plain; charset=utf-8",
+                    "Request too large\n",
+                    true,
+                    null,
+                    &.{},
+                    null,
+                    null,
+                );
+                return flushEventPendingWrite(context, conn);
             }
             break;
         }
@@ -942,59 +974,70 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         const request_end = header_end_rel + 4;
         const request_bytes = conn.request_buffer[0..request_end];
         const request = parseRequest(request_bytes) catch {
-            try sendEventRequestError(context, root, conn, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n");
-            return false;
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                conn.served_requests,
+                false,
+                Io.Timestamp.now(context.io, .awake),
+                "-",
+                "-",
+                null,
+                .{ .code = 400, .reason = "Bad Request" },
+                "text/plain; charset=utf-8",
+                "Bad request\n",
+                true,
+                null,
+                &.{},
+                null,
+                null,
+            );
+            return flushEventPendingWrite(context, conn);
         };
 
         const current_request_count = conn.served_requests + 1;
-        if (try tryServeCachedEventFastPath(context, root, conn, request, request_end, current_request_count, Io.Timestamp.now(context.io, .awake))) |keep_open| {
-            processed_this_tick += 1;
-            if (!keep_open) return false;
-            if (conn.hasPendingWrite()) return true;
-            continue;
-        }
-
-        try setFdNonblocking(conn.stream.socket.handle, false);
-        var writer_buffer: [8192]u8 = undefined;
-        var writer = conn.stream.writer(context.io, &writer_buffer);
-        const out = &writer.interface;
-        const result = try processParsedRequest(
-            context.allocator,
-            context.io,
+        try prepareEventResponse(
+            context,
             root,
-            conn.stream,
-            out,
-            &writer,
+            conn,
             request,
-            conn.remote(),
-            context.config,
-            context.logger,
-            context.cache,
+            request_end,
             current_request_count,
             Io.Timestamp.now(context.io, .awake),
         );
-
-        const remaining = conn.request_len - request_end;
-        if (remaining != 0) {
-            std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[request_end..conn.request_len]);
-        }
-        conn.request_len = remaining;
-        conn.served_requests = current_request_count;
-        conn.last_active = Io.Timestamp.now(context.io, .awake);
-
-        if (!result.keep_open) return false;
-        try setFdNonblocking(conn.stream.socket.handle, true);
         processed_this_tick += 1;
+        const keep_open = try flushEventPendingWrite(context, conn);
+        if (!keep_open) return false;
+        if (conn.hasPendingWrite()) return true;
     }
 
     if (conn.request_len == conn.request_buffer.len) {
-        try sendEventRequestError(context, root, conn, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n");
-        return false;
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            conn.request_len,
+            conn.served_requests,
+            false,
+            Io.Timestamp.now(context.io, .awake),
+            "-",
+            "-",
+            null,
+            .{ .code = 413, .reason = "Payload Too Large" },
+            "text/plain; charset=utf-8",
+            "Request too large\n",
+            true,
+            null,
+            &.{},
+            null,
+            null,
+        );
+        return flushEventPendingWrite(context, conn);
     }
     return true;
 }
 
-fn tryServeCachedEventFastPath(
+fn prepareEventResponse(
     context: *EventWorkerContext,
     root: Io.Dir,
     conn: *EventConnection,
@@ -1002,14 +1045,110 @@ fn tryServeCachedEventFastPath(
     request_end: usize,
     current_request_count: u32,
     start: Io.Timestamp,
-) !?bool {
-    if (request.has_request_body) return null;
+) !void {
+    var keep_open = requestWantsKeepAlive(request, context.config, current_request_count);
+    if (request.has_request_body) {
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            request_end,
+            current_request_count,
+            false,
+            start,
+            request.method,
+            request.target,
+            request.user_agent,
+            .{ .code = 400, .reason = "Bad Request" },
+            "text/plain; charset=utf-8",
+            "Bad request\n",
+            true,
+            null,
+            &.{},
+            null,
+            null,
+        );
+        return;
+    }
 
     const is_head = std.mem.eql(u8, request.method, "HEAD");
-    if (!is_head and !std.mem.eql(u8, request.method, "GET")) return null;
+    if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
+        keep_open = false;
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            request_end,
+            current_request_count,
+            keep_open,
+            start,
+            request.method,
+            request.target,
+            request.user_agent,
+            .{ .code = 405, .reason = "Method Not Allowed" },
+            "text/plain; charset=utf-8",
+            "Method not allowed\n",
+            true,
+            "GET, HEAD",
+            &.{},
+            null,
+            null,
+        );
+        return;
+    }
 
-    const relative_path = normalizeTargetFast(request.target, context.config.dotfiles) orelse return null;
-    const keep_open = requestWantsKeepAlive(request, context.config, current_request_count);
+    var relative_path_owned: ?[]u8 = null;
+    defer if (relative_path_owned) |path| context.allocator.free(path);
+    const relative_path = normalizeTargetFast(request.target, context.config.dotfiles) orelse blk: {
+        relative_path_owned = normalizeTarget(context.allocator, request.target, context.config.dotfiles) catch {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 403, .reason = "Forbidden" },
+                "text/plain; charset=utf-8",
+                "Forbidden\n",
+                !is_head,
+                null,
+                &.{},
+                null,
+                null,
+            );
+            return;
+        };
+        break :blk relative_path_owned.?;
+    };
+
+    return prepareEventPath(
+        context,
+        root,
+        conn,
+        request,
+        relative_path,
+        request_end,
+        current_request_count,
+        keep_open,
+        is_head,
+        start,
+    );
+}
+
+fn prepareEventPath(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    conn: *EventConnection,
+    request: Request,
+    relative_path: []const u8,
+    request_end: usize,
+    current_request_count: u32,
+    keep_open: bool,
+    is_head: bool,
+    start: Io.Timestamp,
+) !void {
     const response_connection = if (keep_open) "keep-alive" else "close";
     const cached = try context.cache.tryPrepareEventResponse(
         context.io,
@@ -1018,43 +1157,347 @@ fn tryServeCachedEventFastPath(
         request.if_modified_since,
         is_head,
         response_connection,
-    ) orelse return null;
+    );
+    if (cached) |response| {
+        conn.pending = .{
+            .header = response.header,
+            .body = response.body,
+            .request_end = request_end,
+            .served_requests_after = current_request_count,
+            .keep_open = keep_open,
+            .access_start = start,
+            .access_record = .{
+                .remote = conn.remote(),
+                .method = request.method,
+                .target = request.target,
+                .status = response.status,
+                .bytes = response.bytes,
+                .duration_us = 0,
+                .user_agent = request.user_agent,
+            },
+        };
+        return;
+    }
 
+    var file = root.openFile(context.io, relative_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 404, .reason = "Not Found" },
+                "text/plain; charset=utf-8",
+                "Not found\n",
+                !is_head,
+                null,
+                &.{},
+                null,
+                null,
+            );
+            return;
+        },
+        error.IsDir => {
+            if (context.config.trailing_slash_redirect and !targetPathHasTrailingSlash(request.target)) {
+                const location = try slashRedirectLocation(context.allocator, request.target);
+                defer context.allocator.free(location);
+                try queueEventMemoryResponse(
+                    context,
+                    conn,
+                    request_end,
+                    current_request_count,
+                    keep_open,
+                    start,
+                    request.method,
+                    request.target,
+                    request.user_agent,
+                    .{ .code = 308, .reason = "Permanent Redirect" },
+                    "text/plain; charset=utf-8",
+                    "Redirecting\n",
+                    !is_head,
+                    null,
+                    context.config.headers,
+                    null,
+                    location,
+                );
+                return;
+            }
+            const index_path = try std.fs.path.join(context.allocator, &.{ relative_path, "index.html" });
+            defer context.allocator.free(index_path);
+            return prepareEventPath(
+                context,
+                root,
+                conn,
+                request,
+                index_path,
+                request_end,
+                current_request_count,
+                keep_open,
+                is_head,
+                start,
+            );
+        },
+        error.AccessDenied => {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 403, .reason = "Forbidden" },
+                "text/plain; charset=utf-8",
+                "Forbidden\n",
+                !is_head,
+                null,
+                &.{},
+                null,
+                null,
+            );
+            return;
+        },
+        else => return err,
+    };
+    var file_owned = true;
+    errdefer if (file_owned) file.close(context.io);
+
+    const stat = try file.stat(context.io);
+    if (stat.kind != .file) {
+        file.close(context.io);
+        file_owned = false;
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            request_end,
+            current_request_count,
+            keep_open,
+            start,
+            request.method,
+            request.target,
+            request.user_agent,
+            .{ .code = 404, .reason = "Not Found" },
+            "text/plain; charset=utf-8",
+            "Not found\n",
+            !is_head,
+            null,
+            &.{},
+            null,
+            null,
+        );
+        return;
+    }
+
+    const content_type = mimeType(relative_path);
+    var last_modified_buffer: [64]u8 = undefined;
+    const last_modified = if (context.config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
+    if (context.config.last_modified) {
+        if (request.if_modified_since) |value| {
+            if (parseHttpDate(value)) |since| {
+                if (since >= stat.mtime.toSeconds()) {
+                    file.close(context.io);
+                    file_owned = false;
+                    try queueEventMemoryResponse(
+                        context,
+                        conn,
+                        request_end,
+                        current_request_count,
+                        keep_open,
+                        start,
+                        request.method,
+                        request.target,
+                        request.user_agent,
+                        .{ .code = 304, .reason = "Not Modified" },
+                        content_type,
+                        "",
+                        false,
+                        null,
+                        context.config.headers,
+                        last_modified,
+                        null,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    const header = try buildHeaderAlloc(
+        context.allocator,
+        .{ .code = 200, .reason = "OK" },
+        content_type,
+        stat.size,
+        response_connection,
+        null,
+        context.config.headers,
+        last_modified,
+        null,
+    );
+    errdefer context.allocator.free(header);
+
+    if (is_head) {
+        file.close(context.io);
+        file_owned = false;
+    }
     conn.pending = .{
-        .header = cached.header,
-        .body = cached.body,
+        .header = header,
         .request_end = request_end,
         .served_requests_after = current_request_count,
         .keep_open = keep_open,
+        .owns_header = true,
+        .file = if (is_head) null else file,
+        .file_remaining = if (is_head) 0 else stat.size,
+        .use_sendfile = !is_head and context.config.sendfile and sendfileSupportedForOs(builtin.os.tag),
         .access_start = start,
         .access_record = .{
             .remote = conn.remote(),
             .method = request.method,
             .target = request.target,
-            .status = cached.status,
-            .bytes = cached.bytes,
+            .status = 200,
+            .bytes = if (is_head) 0 else stat.size,
             .duration_us = 0,
             .user_agent = request.user_agent,
         },
     };
+    file_owned = false;
+}
 
-    return try flushEventPendingWrite(context, conn);
+fn queueEventMemoryResponse(
+    context: *EventWorkerContext,
+    conn: *EventConnection,
+    request_end: usize,
+    served_requests_after: u32,
+    keep_open: bool,
+    start: Io.Timestamp,
+    method: []const u8,
+    target: []const u8,
+    user_agent: ?[]const u8,
+    status: ResponseStatus,
+    content_type: []const u8,
+    body: []const u8,
+    send_body: bool,
+    allow: ?[]const u8,
+    extra_headers: []const Header,
+    last_modified: ?[]const u8,
+    location: ?[]const u8,
+) !void {
+    const connection = if (keep_open) "keep-alive" else "close";
+    const header = try buildHeaderAlloc(
+        context.allocator,
+        status,
+        content_type,
+        body.len,
+        connection,
+        allow,
+        extra_headers,
+        last_modified,
+        location,
+    );
+    conn.pending = .{
+        .header = header,
+        .body = if (send_body) body else &.{},
+        .request_end = request_end,
+        .served_requests_after = served_requests_after,
+        .keep_open = keep_open,
+        .owns_header = true,
+        .access_start = start,
+        .access_record = .{
+            .remote = conn.remote(),
+            .method = method,
+            .target = target,
+            .status = status.code,
+            .bytes = if (send_body) body.len else 0,
+            .duration_us = 0,
+            .user_agent = user_agent,
+        },
+    };
 }
 
 fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) !bool {
     while (conn.pending.active() and !conn.pending.complete()) {
-        const n = writePendingFd(conn.stream.socket.handle, &conn.pending) catch |err| switch (err) {
-            error.WouldBlock => return true,
-            error.BrokenPipe, error.ConnectionResetByPeer, error.SocketUnconnected, error.ConnectionAborted => return false,
-            else => return err,
-        };
-        if (n == 0) return true;
-        advancePendingWrite(&conn.pending, n);
+        if (pendingWriteSlice(&conn.pending) != null) {
+            const n = writePendingFd(conn.stream.socket.handle, &conn.pending) catch |err| switch (err) {
+                error.WouldBlock => return true,
+                error.BrokenPipe, error.ConnectionResetByPeer, error.SocketUnconnected, error.ConnectionAborted => return false,
+                else => return err,
+            };
+            if (n == 0) return true;
+            advancePendingWrite(&conn.pending, n);
+            conn.last_active = Io.Timestamp.now(context.io, .awake);
+            continue;
+        }
+
+        if (conn.pending.file_remaining != 0) {
+            const keep_writing = try flushEventFileBody(context, conn);
+            if (!keep_writing) return true;
+            continue;
+        }
+        break;
     }
 
     if (!conn.pending.active()) return true;
     if (!conn.pending.complete()) return true;
     return finishEventPendingWrite(context, conn);
+}
+
+fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection) !bool {
+    const pending = &conn.pending;
+    const file = pending.file orelse return error.Unexpected;
+
+    if (pending.use_sendfile) {
+        switch (trySendfileStep(conn.stream.socket.handle, file, pending.file_offset, pending.file_remaining)) {
+            .sent => |written| {
+                if (written == 0) return error.EndOfStream;
+                pending.file_offset += written;
+                pending.file_remaining -= written;
+                conn.last_active = Io.Timestamp.now(context.io, .awake);
+                return true;
+            },
+            .would_block => return false,
+            .unsupported => {
+                pending.use_sendfile = false;
+                logSendfileFallback(context.logger, error.SendfileUnsupported);
+            },
+            .failed => |err| return err,
+        }
+    }
+
+    if (pending.file_buffer == null) {
+        pending.file_buffer = try context.allocator.alloc(u8, 64 * 1024);
+    }
+    const buffer = pending.file_buffer.?;
+    if (pending.file_buffer_offset >= pending.file_buffer_len) {
+        const read_len: usize = @intCast(@min(pending.file_remaining, buffer.len));
+        const read = try file.readPositionalAll(context.io, buffer[0..read_len], pending.file_offset);
+        if (read == 0) return error.EndOfStream;
+        pending.file_buffer_offset = 0;
+        pending.file_buffer_len = read;
+    }
+
+    const written = writeFd(
+        conn.stream.socket.handle,
+        buffer[pending.file_buffer_offset..pending.file_buffer_len],
+    ) catch |err| switch (err) {
+        error.WouldBlock => return false,
+        else => return err,
+    };
+    if (written == 0) return false;
+    pending.file_buffer_offset += written;
+    pending.file_offset += written;
+    pending.file_remaining -= written;
+    conn.last_active = Io.Timestamp.now(context.io, .awake);
+    return true;
 }
 
 pub fn pendingWriteSlice(pending: *const PendingEventWrite) ?[]const u8 {
@@ -1078,41 +1521,28 @@ pub fn advancePendingWrite(pending: *PendingEventWrite, written: usize) void {
 }
 
 fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) bool {
-    var pending = conn.pending;
-    finishAccessLog(context.logger, context.io, pending.access_start, &pending.access_record);
+    const request_end = conn.pending.request_end;
+    const served_requests_after = conn.pending.served_requests_after;
+    const keep_open = conn.pending.keep_open;
+    finishAccessLog(context.logger, context.io, conn.pending.access_start, &conn.pending.access_record);
 
-    const remaining = conn.request_len - pending.request_end;
+    const remaining = conn.request_len - request_end;
     if (remaining != 0) {
-        std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[pending.request_end..conn.request_len]);
+        std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[request_end..conn.request_len]);
     }
     conn.request_len = remaining;
-    conn.served_requests = pending.served_requests_after;
+    conn.served_requests = served_requests_after;
     conn.last_active = Io.Timestamp.now(context.io, .awake);
+    releasePendingResources(context, &conn.pending);
     conn.pending = .{};
-    return pending.keep_open;
+    return keep_open;
 }
 
-fn sendEventRequestError(
-    context: *EventWorkerContext,
-    root: Io.Dir,
-    conn: *EventConnection,
-    status: ResponseStatus,
-    body: []const u8,
-) !void {
-    _ = root;
-    try setFdNonblocking(conn.stream.socket.handle, false);
-    var writer_buffer: [1024]u8 = undefined;
-    var writer = conn.stream.writer(context.io, &writer_buffer);
-    try sendRequestError(
-        context.io,
-        context.logger,
-        &writer.interface,
-        &writer,
-        conn.remote(),
-        status,
-        body,
-        Io.Timestamp.now(context.io, .awake),
-    );
+fn releasePendingResources(context: *EventWorkerContext, pending: *PendingEventWrite) void {
+    if (pending.file) |file| file.close(context.io);
+    if (pending.file_buffer) |buffer| context.allocator.free(buffer);
+    if (pending.owns_header) context.allocator.free(@constCast(pending.header));
+    if (pending.owns_body) context.allocator.free(@constCast(pending.body));
 }
 
 pub fn eventWaitTimeoutMs(config: Config) i32 {
@@ -1146,6 +1576,7 @@ fn syncEpollWriteInterest(epoll_fd: std.posix.fd_t, conn: *EventConnection) !voi
 fn syncKqueueWriteInterest(kq_fd: std.posix.fd_t, conn: *EventConnection) !void {
     const enabled = conn.hasPendingWrite();
     if (conn.write_interest == enabled) return;
+    try kqueueSetReadInterest(kq_fd, conn.stream.socket.handle, !enabled);
     try kqueueSetWriteInterest(kq_fd, conn.stream.socket.handle, enabled);
     conn.write_interest = enabled;
 }

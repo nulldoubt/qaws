@@ -137,16 +137,12 @@ pub const StaticCache = struct {
     ) !?CachedEventResponse {
         if (!self.enabled) return null;
 
-        const cached = try self.snapshotExisting(io, root, relative_path, connection) orelse return null;
+        const cached = try self.snapshot(io, root, relative_path, connection) orelse return null;
         return cachedEventResponseFromSnapshot(self.last_modified, cached, if_modified_since, is_head);
     }
 
     fn snapshot(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
         return self.snapshotWithLoad(io, root, relative_path, connection, true);
-    }
-
-    fn snapshotExisting(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8) !?CachedFileSnapshot {
-        return self.snapshotWithLoad(io, root, relative_path, connection, false);
     }
 
     fn snapshotWithLoad(self: *StaticCache, io: Io, root: Io.Dir, relative_path: []const u8, connection: []const u8, allow_load: bool) !?CachedFileSnapshot {

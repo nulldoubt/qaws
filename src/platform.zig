@@ -9,6 +9,13 @@ pub const SendfileResult = union(enum) {
     partial_error: anyerror,
 };
 
+pub const SendfileStepResult = union(enum) {
+    sent: usize,
+    would_block,
+    unsupported,
+    failed: anyerror,
+};
+
 pub const RuntimeBackend = enum {
     worker,
     epoll,
@@ -363,8 +370,8 @@ pub fn epollSetWriteInterest(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, enabl
 }
 
 fn epollConnectionEvents(write_enabled: bool) u32 {
-    var events: u32 = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP;
-    if (write_enabled) events |= std.os.linux.EPOLL.OUT;
+    var events: u32 = std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP;
+    events |= if (write_enabled) std.os.linux.EPOLL.OUT else std.os.linux.EPOLL.IN;
     return events;
 }
 
@@ -429,6 +436,24 @@ pub fn kqueueSetWriteInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled
     }
 }
 
+pub fn kqueueSetReadInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    var changes = [_]std.posix.Kevent{.{
+        .ident = @intCast(fd),
+        .filter = std.c.EVFILT.READ,
+        .flags = if (enabled) std.c.EV.ENABLE else std.c.EV.DISABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = @intCast(fd),
+    }};
+    var ignored: [1]std.posix.Kevent = undefined;
+    const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        .INTR => return kqueueSetReadInterest(kq_fd, fd, enabled),
+        else => return error.Unexpected,
+    }
+}
+
 pub fn kqueueWait(kq_fd: std.posix.fd_t, events: []std.posix.Kevent, timeout_ms: i32) !usize {
     var timeout = std.posix.timespec{
         .sec = @divTrunc(timeout_ms, 1000),
@@ -459,6 +484,82 @@ pub fn trySendfile(stream: Io.net.Stream, file: Io.File, size: u64) SendfileResu
         .freebsd => trySendfileFreebsd(stream, file, size),
         else => .{ .fallback = error.SendfileUnsupported },
     };
+}
+
+pub fn trySendfileStep(
+    socket_fd: std.posix.fd_t,
+    file: Io.File,
+    offset: u64,
+    remaining: u64,
+) SendfileStepResult {
+    if (remaining == 0) return .{ .sent = 0 };
+    return switch (builtin.os.tag) {
+        .linux => trySendfileStepLinux(socket_fd, file, offset, remaining),
+        .macos => trySendfileStepDarwin(socket_fd, file, offset, remaining),
+        .freebsd => trySendfileStepFreebsd(socket_fd, file, offset, remaining),
+        else => .unsupported,
+    };
+}
+
+fn trySendfileStepLinux(socket_fd: std.posix.fd_t, file: Io.File, offset_value: u64, remaining: u64) SendfileStepResult {
+    var offset: i64 = std.math.cast(i64, offset_value) orelse return .{ .failed = error.FileTooBig };
+    const chunk = @min(remaining, @as(u64, 1 << 30));
+    while (true) {
+        const rc = std.os.linux.sendfile(socket_fd, file.handle, &offset, @intCast(chunk));
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return .{ .sent = @intCast(rc) },
+            .INTR => continue,
+            .AGAIN => return .would_block,
+            .INVAL, .NOSYS, .OPNOTSUPP, .NOTSOCK => return .unsupported,
+            .PIPE => return .{ .failed = error.BrokenPipe },
+            .CONNRESET => return .{ .failed = error.ConnectionResetByPeer },
+            .NOTCONN => return .{ .failed = error.SocketUnconnected },
+            .CONNABORTED => return .{ .failed = error.ConnectionAborted },
+            else => return .{ .failed = error.SendfileFailed },
+        }
+    }
+}
+
+fn trySendfileStepDarwin(socket_fd: std.posix.fd_t, file: Io.File, offset_value: u64, remaining: u64) SendfileStepResult {
+    const offset: std.c.off_t = std.math.cast(std.c.off_t, offset_value) orelse return .{ .failed = error.FileTooBig };
+    const chunk = @min(remaining, @as(u64, @intCast(std.math.maxInt(i32))));
+    while (true) {
+        var len: std.c.off_t = @intCast(chunk);
+        const rc = std.c.sendfile(file.handle, socket_fd, offset, &len, null, 0);
+        const transferred: usize = if (len > 0) @intCast(len) else 0;
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{ .sent = transferred },
+            .INTR => if (transferred == 0) continue else return .{ .sent = transferred },
+            .AGAIN => if (transferred == 0) return .would_block else return .{ .sent = transferred },
+            .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return .unsupported,
+            .PIPE => return .{ .failed = error.BrokenPipe },
+            .CONNRESET => return .{ .failed = error.ConnectionResetByPeer },
+            .NOTCONN => return .{ .failed = error.SocketUnconnected },
+            .CONNABORTED => return .{ .failed = error.ConnectionAborted },
+            else => return .{ .failed = error.SendfileFailed },
+        }
+    }
+}
+
+fn trySendfileStepFreebsd(socket_fd: std.posix.fd_t, file: Io.File, offset_value: u64, remaining: u64) SendfileStepResult {
+    const offset: std.c.off_t = std.math.cast(std.c.off_t, offset_value) orelse return .{ .failed = error.FileTooBig };
+    const chunk = @min(remaining, @as(u64, std.math.maxInt(usize)));
+    while (true) {
+        var sent_bytes: std.c.off_t = 0;
+        const rc = std.c.sendfile(file.handle, socket_fd, offset, @intCast(chunk), null, &sent_bytes, 0);
+        const transferred: usize = if (sent_bytes > 0) @intCast(sent_bytes) else 0;
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{ .sent = transferred },
+            .INTR, .BUSY => if (transferred == 0) continue else return .{ .sent = transferred },
+            .AGAIN => if (transferred == 0) return .would_block else return .{ .sent = transferred },
+            .INVAL, .OPNOTSUPP, .NOTSOCK, .NOSYS => return .unsupported,
+            .PIPE => return .{ .failed = error.BrokenPipe },
+            .CONNRESET => return .{ .failed = error.ConnectionResetByPeer },
+            .NOTCONN => return .{ .failed = error.SocketUnconnected },
+            .CONNABORTED => return .{ .failed = error.ConnectionAborted },
+            else => return .{ .failed = error.SendfileFailed },
+        }
+    }
 }
 
 fn fallbackOrPartial(sent: u64, err: anyerror) SendfileResult {
