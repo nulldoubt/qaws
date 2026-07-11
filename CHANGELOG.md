@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Centralized compiled version metadata for the executable and build system.
 - Split asynchronous logging, access records, and log queues into a focused Zig module.
 - Split configuration defaults, JSON types, validation, and protected-header policy into a focused Zig module.
 - Bumped qaws version metadata, package metadata, Docker tags, and documentation to 0.2.7.

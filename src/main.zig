@@ -2,12 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config_mod = @import("config.zig");
 const logging = @import("logging.zig");
+const qaws_version = @import("version.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 
-const version = "0.2.7";
+const version = qaws_version.string;
 const server_name = "qaws/" ++ version;
 const max_request_bytes = 16 * 1024;
 const default_keep_alive_timeout_ms = config_mod.default_keep_alive_timeout_ms;

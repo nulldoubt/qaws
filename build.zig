@@ -1,6 +1,7 @@
 const std = @import("std");
+const version = @import("src/version.zig");
 
-const qaws_version = "0.2.7";
+const qaws_version = version.string;
 
 const ReleaseTarget = struct {
     triple: []const u8,
@@ -84,7 +85,7 @@ fn addQawsExecutable(
             .optimize = optimize,
             .strip = optimize != .Debug,
         }),
-        .version = .{ .major = 0, .minor = 2, .patch = 7 },
+        .version = .{ .major = version.major, .minor = version.minor, .patch = version.patch },
     });
     if (target.result.abi.isAndroid()) {
         exe.pie = true;
