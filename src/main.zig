@@ -113,6 +113,8 @@ const RuntimeBackend = platform.RuntimeBackend;
 const WakePipe = platform.WakePipe;
 const selectRuntimeBackend = platform.selectRuntimeBackend;
 const runtimeBackendName = platform.runtimeBackendName;
+const detectPerformanceCpuCount = platform.detectPerformanceCpuCount;
+const highestCapacityCpuCount = platform.highestCapacityCpuCount;
 const createWakePipe = platform.createWakePipe;
 const closeWakePipe = platform.closeWakePipe;
 const wakeFd = platform.wakeFd;
@@ -1084,8 +1086,16 @@ test "pipelined malformed request is rejected after prior request" {
 }
 
 test "worker count resolves explicit and automatic defaults" {
-    try std.testing.expectEqual(@as(usize, 3), resolveWorkerCount(.{ .workers = 3 }));
-    try std.testing.expect(resolveWorkerCount(.{}) >= 1);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectEqual(@as(usize, 3), resolveWorkerCount(io, .{ .workers = 3 }));
+    try std.testing.expect(resolveWorkerCount(io, .{}) >= 1);
+}
+
+test "worker topology selects the highest capacity cluster" {
+    const capacities = [_]u32{ 322, 322, 322, 322, 322, 322, 1024, 1024 };
+    try std.testing.expectEqual(@as(usize, 2), highestCapacityCpuCount(&capacities));
+    try std.testing.expectEqual(@as(usize, 0), highestCapacityCpuCount(&.{ 0, 0 }));
+    try std.testing.expect(detectPerformanceCpuCount(std.Io.Threaded.global_single_threaded.io()) >= 1);
 }
 
 test "runtime backend selection follows supported platforms" {

@@ -36,6 +36,70 @@ pub fn runtimeBackendName(backend: RuntimeBackend) []const u8 {
     };
 }
 
+pub fn detectPerformanceCpuCount(io: Io) usize {
+    const logical_count = @max(@as(usize, 1), std.Thread.getCpuCount() catch 1);
+    return switch (builtin.os.tag) {
+        .linux => detectLinuxPerformanceCpuCount(io, logical_count) orelse logical_count,
+        .macos => detectMacPerformanceCpuCount() orelse logical_count,
+        else => logical_count,
+    };
+}
+
+pub fn highestCapacityCpuCount(capacities: []const u32) usize {
+    var highest: u32 = 0;
+    var count: usize = 0;
+    for (capacities) |capacity| {
+        if (capacity > highest) {
+            highest = capacity;
+            count = 1;
+        } else if (capacity == highest and capacity != 0) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn detectLinuxPerformanceCpuCount(io: Io, logical_count: usize) ?usize {
+    var capacities: [1024]u32 = undefined;
+    const count = @min(logical_count, capacities.len);
+    var found: usize = 0;
+
+    for (0..count) |cpu| {
+        var path_buffer: [96]u8 = undefined;
+        const path = std.fmt.bufPrint(
+            &path_buffer,
+            "/sys/devices/system/cpu/cpu{d}/cpu_capacity",
+            .{cpu},
+        ) catch return null;
+        var value_buffer: [32]u8 = undefined;
+        const value = Io.Dir.cwd().readFile(io, path, &value_buffer) catch continue;
+        const capacity = std.fmt.parseInt(u32, std.mem.trim(u8, value, &std.ascii.whitespace), 10) catch continue;
+        if (capacity == 0) continue;
+        capacities[found] = capacity;
+        found += 1;
+    }
+
+    if (found == 0) return null;
+    const selected = highestCapacityCpuCount(capacities[0..found]);
+    return if (selected == 0) null else selected;
+}
+
+fn detectMacPerformanceCpuCount() ?usize {
+    if (comptime builtin.os.tag != .macos) return null;
+
+    var count: c_int = 0;
+    var count_len: usize = @sizeOf(c_int);
+    const rc = std.posix.system.sysctlbyname(
+        "hw.perflevel0.logicalcpu",
+        &count,
+        &count_len,
+        null,
+        0,
+    );
+    if (std.posix.errno(rc) != .SUCCESS or count <= 0) return null;
+    return @intCast(count);
+}
+
 pub fn createWakePipe() !WakePipe {
     return switch (builtin.os.tag) {
         .linux => blk: {

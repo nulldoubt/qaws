@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Selected automatic workers from the highest-capacity CPU cluster with portable logical-CPU fallback.
 - Split worker queues, connection handling, event loops, and static response serving into a focused Zig module.
 - Split backend selection, event syscalls, descriptor helpers, and platform sendfile into a focused Zig module.
 - Split static cache ownership, snapshots, and prebuilt responses into a focused Zig module.

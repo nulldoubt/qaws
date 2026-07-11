@@ -65,6 +65,7 @@ const RuntimeBackend = platform.RuntimeBackend;
 const WakePipe = platform.WakePipe;
 const selectRuntimeBackend = platform.selectRuntimeBackend;
 const runtimeBackendName = platform.runtimeBackendName;
+const detectPerformanceCpuCount = platform.detectPerformanceCpuCount;
 const createWakePipe = platform.createWakePipe;
 const closeWakePipe = platform.closeWakePipe;
 const wakeFd = platform.wakeFd;
@@ -278,7 +279,7 @@ fn serveBlockingWorkers(
     server: *Io.net.Server,
     backend: RuntimeBackend,
 ) !void {
-    const worker_count = resolveWorkerCount(config);
+    const worker_count = resolveWorkerCount(io, config);
     var queue = try WorkerQueue.init(allocator, io, @intCast(config.max_connections));
     defer queue.deinit();
 
@@ -351,7 +352,7 @@ fn serveEventWorkers(
     server: *Io.net.Server,
     backend: RuntimeBackend,
 ) !void {
-    const worker_count = resolveWorkerCount(config);
+    const worker_count = resolveWorkerCount(io, config);
     var queues = try allocator.alloc(WorkerQueue, worker_count);
     defer allocator.free(queues);
     var pipes = try allocator.alloc(WakePipe, worker_count);
@@ -445,10 +446,9 @@ fn serveEventWorkers(
     logger.event("info", "shutdown", .{}) catch {};
 }
 
-pub fn resolveWorkerCount(config: Config) usize {
+pub fn resolveWorkerCount(io: Io, config: Config) usize {
     if (config.workers > 0) return @intCast(config.workers);
-    const detected = std.Thread.getCpuCount() catch 1;
-    return @max(@as(usize, 1), detected);
+    return detectPerformanceCpuCount(io);
 }
 
 pub fn tryAcquireConnection(active_connections: *std.atomic.Value(u32), max_connections: u32) bool {
