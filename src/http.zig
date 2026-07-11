@@ -67,6 +67,29 @@ pub const RangeSelection = union(enum) {
     satisfiable: ByteRange,
 };
 
+pub const ContentCoding = enum {
+    identity,
+    gzip,
+    brotli,
+};
+
+pub const EncodingAvailability = struct {
+    identity: bool,
+    gzip: bool,
+    brotli: bool,
+};
+
+pub const EncodingSelection = union(enum) {
+    selected: ContentCoding,
+    not_acceptable,
+};
+
+const EncodingPreferences = struct {
+    identity: u16,
+    gzip: u16,
+    brotli: u16,
+};
+
 pub fn parseRequest(bytes: []const u8) !Request {
     return parseRequestOptions(bytes, true);
 }
@@ -467,6 +490,92 @@ fn parseDecimal(value: []const u8) ?u64 {
     if (value.len == 0) return null;
     for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
     return std.fmt.parseInt(u64, value, 10) catch null;
+}
+
+pub fn selectContentEncoding(
+    header_value: ?[]const u8,
+    availability: EncodingAvailability,
+) EncodingSelection {
+    const preferences = parseAcceptEncoding(header_value);
+    var selected: ?ContentCoding = null;
+    var selected_quality: u16 = 0;
+
+    const candidates = [_]struct { ContentCoding, bool, u16 }{
+        .{ .brotli, availability.brotli, preferences.brotli },
+        .{ .gzip, availability.gzip, preferences.gzip },
+        .{ .identity, availability.identity, preferences.identity },
+    };
+    for (candidates) |candidate| {
+        const coding, const available, const quality = candidate;
+        if (!available or quality == 0) continue;
+        if (selected == null or quality > selected_quality) {
+            selected = coding;
+            selected_quality = quality;
+        }
+    }
+    return if (selected) |coding| .{ .selected = coding } else .not_acceptable;
+}
+
+fn parseAcceptEncoding(header_value: ?[]const u8) EncodingPreferences {
+    const value = header_value orelse return .{ .identity = 1000, .gzip = 0, .brotli = 0 };
+    var identity: ?u16 = null;
+    var gzip: ?u16 = null;
+    var brotli: ?u16 = null;
+    var wildcard: ?u16 = null;
+
+    var entries = std.mem.splitScalar(u8, value, ',');
+    while (entries.next()) |entry_raw| {
+        var parts = std.mem.splitScalar(u8, entry_raw, ';');
+        const name = std.mem.trim(u8, parts.next() orelse continue, " \t");
+        if (name.len == 0) continue;
+        var quality: u16 = 1000;
+        var valid = true;
+        while (parts.next()) |parameter_raw| {
+            const parameter = std.mem.trim(u8, parameter_raw, " \t");
+            const equals = std.mem.indexOfScalar(u8, parameter, '=') orelse continue;
+            const key = std.mem.trim(u8, parameter[0..equals], " \t");
+            if (!std.ascii.eqlIgnoreCase(key, "q")) continue;
+            quality = parseQuality(std.mem.trim(u8, parameter[equals + 1 ..], " \t")) orelse {
+                valid = false;
+                break;
+            };
+        }
+        if (!valid) continue;
+
+        if (std.ascii.eqlIgnoreCase(name, "br")) {
+            brotli = @max(brotli orelse 0, quality);
+        } else if (std.ascii.eqlIgnoreCase(name, "gzip")) {
+            gzip = @max(gzip orelse 0, quality);
+        } else if (std.ascii.eqlIgnoreCase(name, "identity")) {
+            identity = @max(identity orelse 0, quality);
+        } else if (std.mem.eql(u8, name, "*")) {
+            wildcard = @max(wildcard orelse 0, quality);
+        }
+    }
+
+    return .{
+        .brotli = brotli orelse wildcard orelse 0,
+        .gzip = gzip orelse wildcard orelse 0,
+        .identity = identity orelse wildcard orelse 1000,
+    };
+}
+
+fn parseQuality(value: []const u8) ?u16 {
+    if (std.mem.eql(u8, value, "0")) return 0;
+    if (std.mem.eql(u8, value, "1")) return 1000;
+    if (value.len < 2 or value.len > 5 or value[1] != '.') return null;
+    if (value[0] != '0' and value[0] != '1') return null;
+    const fraction = value[2..];
+    if (fraction.len > 3) return null;
+    var result: u16 = 0;
+    var scale: u16 = 100;
+    for (fraction) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+        result += @as(u16, byte - '0') * scale;
+        scale = @divExact(scale, 10);
+    }
+    if (value[0] == '1') return if (result == 0) 1000 else null;
+    return result;
 }
 
 fn parseHttpMonth(value: []const u8) ?u8 {

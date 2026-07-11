@@ -11,6 +11,15 @@ pub const Representation = enum(u8) {
     brotli,
 };
 
+pub const Availability = enum(u8) {
+    unknown,
+    cached,
+    uncached,
+    unavailable,
+    directory,
+    forbidden,
+};
+
 const CacheKey = struct {
     path: []const u8,
     representation: Representation,
@@ -35,6 +44,7 @@ const Generation = struct {
     size: u64,
     mtime_sec: i64,
     mtime_ns: i96,
+    representation: Representation,
     etag_buffer: [128]u8,
     etag_len: usize,
     last_modified_buffer: [64]u8,
@@ -52,6 +62,7 @@ const Generation = struct {
             .size = self.size,
             .mtime_sec = self.mtime_sec,
             .mtime_ns = self.mtime_ns,
+            .representation = self.representation,
             .etag = if (self.etag_len == 0) null else self.etag_buffer[0..self.etag_len],
             .last_modified = if (self.last_modified_len == 0) null else self.last_modified_buffer[0..self.last_modified_len],
             .header_200 = if (keep_alive)
@@ -73,6 +84,7 @@ const CacheSlot = struct {
     current: ?*Generation = null,
     version: std.atomic.Value(u64) = .init(0),
     revalidate_after_ms: std.atomic.Value(i64) = .init(0),
+    availability: std.atomic.Value(u8) = .init(@intFromEnum(Availability.unknown)),
     memory_bytes: usize,
 
     fn key(self: *const CacheSlot) CacheKey {
@@ -125,6 +137,7 @@ pub const CachedFileSnapshot = struct {
     size: u64,
     mtime_sec: i64,
     mtime_ns: i96 = 0,
+    representation: Representation = .identity,
     etag: ?[]const u8 = null,
     last_modified: ?[]const u8 = null,
     header_200: []const u8,
@@ -146,6 +159,7 @@ pub const StaticCache = struct {
     last_modified: bool,
     etag: bool,
     range_requests: bool,
+    precompressed: bool,
     headers: []const config_mod.Header,
     metadata_mutex: Io.Mutex = .init,
     slots: SlotMap = .empty,
@@ -161,6 +175,7 @@ pub const StaticCache = struct {
             .last_modified = config.last_modified,
             .etag = config.etag,
             .range_requests = config.range_requests,
+            .precompressed = config.precompressed,
             .headers = config.headers,
         };
     }
@@ -268,11 +283,42 @@ pub const CacheView = struct {
         is_head: bool,
         connection: []const u8,
     ) !?http.ResponseResult {
-        var prepared = try self.prepare(
+        return self.tryServeRepresentation(
             root,
+            out,
+            stream_writer,
             relative_path,
             relative_path,
             .identity,
+            if_none_match,
+            if_modified_since,
+            range_value,
+            if_range,
+            is_head,
+            connection,
+        );
+    }
+
+    pub fn tryServeRepresentation(
+        self: *CacheView,
+        root: Io.Dir,
+        out: *Io.Writer,
+        stream_writer: *Io.net.Stream.Writer,
+        logical_path: []const u8,
+        physical_path: []const u8,
+        representation: Representation,
+        if_none_match: ?[]const u8,
+        if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+    ) !?http.ResponseResult {
+        var prepared = try self.prepare(
+            root,
+            logical_path,
+            physical_path,
+            representation,
             if_none_match,
             if_modified_since,
             range_value,
@@ -367,6 +413,28 @@ pub const CacheView = struct {
         return response;
     }
 
+    pub fn representationAvailability(
+        self: *CacheView,
+        root: Io.Dir,
+        logical_path: []const u8,
+        physical_path: []const u8,
+        representation: Representation,
+    ) !Availability {
+        if (!self.cache.enabled) return .unknown;
+        const slot = try self.cache.getOrCreateSlot(
+            self.io,
+            logical_path,
+            physical_path,
+            representation,
+        ) orelse return .unknown;
+        const now = Io.Timestamp.now(self.io, .awake);
+        const now_ms = timestampMilliseconds(now);
+        if (now_ms >= slot.revalidate_after_ms.load(.monotonic)) {
+            try self.refresh(root, slot, now, now_ms);
+        }
+        return @enumFromInt(slot.availability.load(.monotonic));
+    }
+
     fn rangeResponse(
         self: *CacheView,
         cached: CachedFileSnapshot,
@@ -399,6 +467,7 @@ pub const CacheView = struct {
                         .etag = cached.etag,
                         .accept_ranges = true,
                         .content_range = content_range,
+                        .vary_accept_encoding = self.cache.precompressed,
                     },
                 );
                 break :blk .{
@@ -424,6 +493,8 @@ pub const CacheView = struct {
                         .etag = cached.etag,
                         .accept_ranges = true,
                         .content_range = content_range,
+                        .content_encoding = representationEncoding(cached.representation),
+                        .vary_accept_encoding = self.cache.precompressed,
                     },
                 );
                 const start: usize = @intCast(range.start);
@@ -487,7 +558,13 @@ pub const CacheView = struct {
             .resolve_beneath = true,
         }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir, error.IsDir, error.AccessDenied => {
+                const availability: Availability = switch (err) {
+                    error.IsDir => .directory,
+                    error.AccessDenied => .forbidden,
+                    else => .unavailable,
+                };
                 old_generation = replaceCurrent(slot, null);
+                slot.availability.store(@intFromEnum(availability), .monotonic);
                 slot.revalidate_after_ms.store(next_revalidation, .monotonic);
                 return;
             },
@@ -503,23 +580,30 @@ pub const CacheView = struct {
         };
         if (stat.kind != .file or body_len > self.cache.max_file_bytes) {
             old_generation = replaceCurrent(slot, null);
+            slot.availability.store(
+                @intFromEnum(if (stat.kind == .file) Availability.uncached else Availability.unavailable),
+                .monotonic,
+            );
             slot.revalidate_after_ms.store(next_revalidation, .monotonic);
             return;
         }
 
         if (slot.current) |current| {
             if (current.size == stat.size and current.mtime_ns == stat.mtime.nanoseconds) {
+                slot.availability.store(@intFromEnum(Availability.cached), .monotonic);
                 slot.revalidate_after_ms.store(next_revalidation, .monotonic);
                 return;
             }
         }
 
-        const fresh = try buildGeneration(self.cache, self.io, file, stat, slot.path, now) orelse {
+        const fresh = try buildGeneration(self.cache, self.io, file, stat, slot.path, slot.representation, now) orelse {
             old_generation = replaceCurrent(slot, null);
+            slot.availability.store(@intFromEnum(Availability.uncached), .monotonic);
             slot.revalidate_after_ms.store(next_revalidation, .monotonic);
             return;
         };
         old_generation = replaceCurrent(slot, fresh);
+        slot.availability.store(@intFromEnum(Availability.cached), .monotonic);
         slot.revalidate_after_ms.store(next_revalidation, .monotonic);
     }
 };
@@ -537,6 +621,7 @@ fn buildGeneration(
     file: Io.File,
     stat: Io.File.Stat,
     logical_path: []const u8,
+    representation: Representation,
     now: Io.Timestamp,
 ) !?*Generation {
     _ = now;
@@ -550,9 +635,10 @@ fn buildGeneration(
     const content_type = http.mimeType(logical_path);
     var etag_buffer: [128]u8 = undefined;
     const etag = if (cache.etag)
-        http.formatWeakEtag(stat.mtime.nanoseconds, stat.size, "identity", &etag_buffer)
+        http.formatWeakEtag(stat.mtime.nanoseconds, stat.size, representationName(representation), &etag_buffer)
     else
         null;
+    const content_encoding = representationEncoding(representation);
 
     const header_200_keep_alive = try http.buildHeaderAllocExtended(
         cache.allocator,
@@ -561,7 +647,13 @@ fn buildGeneration(
         stat.size,
         "keep-alive",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = cache.range_requests,
+            .content_encoding = content_encoding,
+            .vary_accept_encoding = cache.precompressed,
+        },
     );
     defer cache.allocator.free(header_200_keep_alive);
 
@@ -577,7 +669,13 @@ fn buildGeneration(
         stat.size,
         "close",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = cache.range_requests,
+            .content_encoding = content_encoding,
+            .vary_accept_encoding = cache.precompressed,
+        },
     );
     errdefer cache.allocator.free(header_200_close);
     const header_304_keep_alive = try http.buildHeaderAllocExtended(
@@ -587,7 +685,13 @@ fn buildGeneration(
         0,
         "keep-alive",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = cache.range_requests,
+            .content_encoding = content_encoding,
+            .vary_accept_encoding = cache.precompressed,
+        },
     );
     errdefer cache.allocator.free(header_304_keep_alive);
     const header_304_close = try http.buildHeaderAllocExtended(
@@ -597,7 +701,13 @@ fn buildGeneration(
         0,
         "close",
         cache.headers,
-        .{ .last_modified = last_modified, .etag = etag, .accept_ranges = cache.range_requests },
+        .{
+            .last_modified = last_modified,
+            .etag = etag,
+            .accept_ranges = cache.range_requests,
+            .content_encoding = content_encoding,
+            .vary_accept_encoding = cache.precompressed,
+        },
     );
     errdefer cache.allocator.free(header_304_close);
 
@@ -616,6 +726,7 @@ fn buildGeneration(
         .size = stat.size,
         .mtime_sec = stat.mtime.toSeconds(),
         .mtime_ns = stat.mtime.nanoseconds,
+        .representation = representation,
         .etag_buffer = undefined,
         .etag_len = if (etag) |value| value.len else 0,
         .last_modified_buffer = undefined,
@@ -633,6 +744,22 @@ fn buildGeneration(
 
 fn retainGeneration(generation: *Generation) void {
     _ = generation.references.fetchAdd(1, .monotonic);
+}
+
+fn representationName(representation: Representation) []const u8 {
+    return switch (representation) {
+        .identity => "identity",
+        .gzip => "gzip",
+        .brotli => "br",
+    };
+}
+
+fn representationEncoding(representation: Representation) ?[]const u8 {
+    return switch (representation) {
+        .identity => null,
+        .gzip => "gzip",
+        .brotli => "br",
+    };
 }
 
 fn releaseGeneration(io: Io, generation: *Generation) void {
@@ -808,4 +935,56 @@ test "cache serves uncached when metadata cannot fit the cap" {
         "keep-alive",
     ) == null);
     try std.testing.expectEqual(@as(usize, 0), cache.residentBytes(io));
+}
+
+test "cache keeps precompressed representations distinct" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "app.js", .data = "identity-body" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "app.js.gz", .data = "gzip-body" });
+
+    var cache = StaticCache.init(allocator, .{ .cache_max_total_bytes = 1024 * 1024 });
+    defer cache.deinit(io);
+    var view = cache.view(io);
+    defer view.deinit();
+
+    var gzip = (try view.prepare(
+        temporary.dir,
+        "app.js",
+        "app.js.gz",
+        .gzip,
+        null,
+        null,
+        null,
+        null,
+        false,
+        "keep-alive",
+    )).?;
+    defer if (gzip.lease) |*lease| lease.release();
+    try std.testing.expect(std.mem.indexOf(u8, gzip.header, "Content-Type: application/javascript; charset=utf-8\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gzip.header, "Content-Encoding: gzip\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gzip.header, "Vary: Accept-Encoding\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gzip.header, "-gzip\"\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, gzip.header, "gzip-body"));
+
+    var identity = (try view.prepare(
+        temporary.dir,
+        "app.js",
+        "app.js",
+        .identity,
+        null,
+        null,
+        null,
+        null,
+        false,
+        "keep-alive",
+    )).?;
+    defer if (identity.lease) |*lease| lease.release();
+    try std.testing.expect(std.mem.indexOf(u8, identity.header, "Content-Encoding:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, identity.header, "-identity\"\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, identity.header, "identity-body"));
+    try std.testing.expect(cache.slots.get(.{ .path = "app.js", .representation = .gzip }) != null);
+    try std.testing.expect(cache.slots.get(.{ .path = "app.js", .representation = .identity }) != null);
 }

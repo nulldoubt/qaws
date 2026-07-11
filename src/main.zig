@@ -109,6 +109,7 @@ const selectByteRange = http.selectByteRange;
 const ifRangeAllows = http.ifRangeAllows;
 const formatContentRange = http.formatContentRange;
 const formatUnsatisfiedContentRange = http.formatUnsatisfiedContentRange;
+const selectContentEncoding = http.selectContentEncoding;
 const sendHeaders = http.sendHeaders;
 const buildHeaderAlloc = http.buildHeaderAlloc;
 const mimeType = http.mimeType;
@@ -1476,6 +1477,7 @@ test "json config applies values and cli overrides" {
         \\    "sendfile": false,
         \\    "etag": false,
         \\    "range_requests": false,
+        \\    "precompressed": false,
         \\    "keep_alive_timeout_ms": 2000,
         \\    "max_requests_per_connection": 100,
         \\    "max_connections": 64,
@@ -1510,6 +1512,7 @@ test "json config applies values and cli overrides" {
     try std.testing.expect(!config.sendfile);
     try std.testing.expect(!config.etag);
     try std.testing.expect(!config.range_requests);
+    try std.testing.expect(!config.precompressed);
     try std.testing.expectEqual(@as(u32, 2000), config.keep_alive_timeout_ms);
     try std.testing.expectEqual(@as(u32, 100), config.max_requests_per_connection);
     try std.testing.expectEqual(@as(u32, 64), config.max_connections);
@@ -1727,6 +1730,23 @@ test "byte range selection supports single forms and ignores multipart sets" {
     var buffer: [96]u8 = undefined;
     try std.testing.expectEqualStrings("bytes 2-5/10", formatContentRange(normal, 10, &buffer));
     try std.testing.expectEqualStrings("bytes */10", formatUnsatisfiedContentRange(10, &buffer));
+}
+
+test "content encoding negotiation honors q values and stable tie breaks" {
+    const all = http.EncodingAvailability{ .identity = true, .gzip = true, .brotli = true };
+    try std.testing.expectEqual(http.ContentCoding.identity, selectContentEncoding(null, all).selected);
+    try std.testing.expectEqual(http.ContentCoding.brotli, selectContentEncoding("gzip, BR", all).selected);
+    try std.testing.expectEqual(http.ContentCoding.gzip, selectContentEncoding("br;q=0.4, gzip;q=0.8, identity;q=0.5", all).selected);
+    try std.testing.expectEqual(http.ContentCoding.identity, selectContentEncoding("br;q=0, gzip;q=0", all).selected);
+    try std.testing.expectEqual(http.ContentCoding.brotli, selectContentEncoding("*;q=0.5", all).selected);
+    try std.testing.expectEqual(
+        http.EncodingSelection.not_acceptable,
+        selectContentEncoding("br;q=0, gzip;q=0, identity;q=0", all),
+    );
+    try std.testing.expectEqual(
+        http.ContentCoding.gzip,
+        selectContentEncoding("br, gzip", .{ .identity = true, .gzip = true, .brotli = false }).selected,
+    );
 }
 
 test "runtime path component sanitization" {

@@ -70,6 +70,8 @@ const CachedEventResponse = cache_mod.CachedEventResponse;
 const CachedFileSnapshot = cache_mod.CachedFileSnapshot;
 const CacheLease = cache_mod.CacheLease;
 const CacheView = cache_mod.CacheView;
+const CacheAvailability = cache_mod.Availability;
+const Representation = cache_mod.Representation;
 const StaticCache = cache_mod.StaticCache;
 const cachedEventResponseFromSnapshot = cache_mod.cachedEventResponseFromSnapshot;
 const SendfileResult = platform.SendfileResult;
@@ -279,6 +281,19 @@ pub const PendingEventWrite = struct {
 
 const ProcessRequestResult = struct {
     keep_open: bool,
+};
+
+const RepresentationChoice = struct {
+    representation: Representation,
+    physical_path: []const u8,
+};
+
+const RepresentationSelection = union(enum) {
+    selected: RepresentationChoice,
+    directory,
+    forbidden,
+    not_found,
+    not_acceptable,
 };
 
 pub const WorkerQueue = struct {
@@ -1246,6 +1261,122 @@ fn compactEventRequestBuffer(conn: *EventConnection) void {
     conn.request_len = remaining;
 }
 
+fn selectRepresentation(
+    cache_view: *CacheView,
+    io: Io,
+    root: Io.Dir,
+    logical_path: []const u8,
+    accept_encoding: ?[]const u8,
+    config: Config,
+    brotli_buffer: []u8,
+    gzip_buffer: []u8,
+) !RepresentationSelection {
+    if (!config.precompressed or accept_encoding == null or isDirectSidecarPath(logical_path)) {
+        return .{ .selected = .{ .representation = .identity, .physical_path = logical_path } };
+    }
+
+    const brotli_path = appendSidecarPath(logical_path, ".br", brotli_buffer);
+    const gzip_path = appendSidecarPath(logical_path, ".gz", gzip_buffer);
+    const identity_state = try representationAvailability(
+        cache_view,
+        io,
+        root,
+        logical_path,
+        logical_path,
+        .identity,
+    );
+    if (identity_state == .directory) return .directory;
+
+    const brotli_state = if (brotli_path) |path|
+        try representationAvailability(cache_view, io, root, logical_path, path, .brotli)
+    else
+        CacheAvailability.unavailable;
+    const gzip_state = if (gzip_path) |path|
+        try representationAvailability(cache_view, io, root, logical_path, path, .gzip)
+    else
+        CacheAvailability.unavailable;
+
+    const availability = http.EncodingAvailability{
+        .identity = isAvailableRepresentation(identity_state),
+        .gzip = isAvailableRepresentation(gzip_state),
+        .brotli = isAvailableRepresentation(brotli_state),
+    };
+    if (!availability.identity and !availability.gzip and !availability.brotli) {
+        return if (identity_state == .forbidden) .forbidden else .not_found;
+    }
+
+    return switch (http.selectContentEncoding(accept_encoding, availability)) {
+        .not_acceptable => .not_acceptable,
+        .selected => |coding| .{ .selected = switch (coding) {
+            .identity => .{ .representation = .identity, .physical_path = logical_path },
+            .gzip => .{ .representation = .gzip, .physical_path = gzip_path.? },
+            .brotli => .{ .representation = .brotli, .physical_path = brotli_path.? },
+        } },
+    };
+}
+
+fn representationAvailability(
+    cache_view: *CacheView,
+    io: Io,
+    root: Io.Dir,
+    logical_path: []const u8,
+    physical_path: []const u8,
+    representation: Representation,
+) !CacheAvailability {
+    const cached = try cache_view.representationAvailability(
+        root,
+        logical_path,
+        physical_path,
+        representation,
+    );
+    if (cached != .unknown) return cached;
+
+    var file = root.openFile(io, physical_path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .resolve_beneath = true,
+    }) catch |err| return switch (err) {
+        error.FileNotFound, error.NotDir => .unavailable,
+        error.IsDir => .directory,
+        error.AccessDenied => .forbidden,
+        else => err,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    return if (stat.kind == .file) .uncached else .unavailable;
+}
+
+fn isAvailableRepresentation(availability: CacheAvailability) bool {
+    return availability == .cached or availability == .uncached;
+}
+
+fn appendSidecarPath(path: []const u8, suffix: []const u8, buffer: []u8) ?[]const u8 {
+    if (path.len + suffix.len > buffer.len) return null;
+    @memcpy(buffer[0..path.len], path);
+    @memcpy(buffer[path.len..][0..suffix.len], suffix);
+    return buffer[0 .. path.len + suffix.len];
+}
+
+fn isDirectSidecarPath(path: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(path, ".br") or std.ascii.endsWithIgnoreCase(path, ".gz");
+}
+
+fn representationName(representation: Representation) []const u8 {
+    return switch (representation) {
+        .identity => "identity",
+        .gzip => "gzip",
+        .brotli => "br",
+    };
+}
+
+fn representationEncoding(representation: Representation) ?[]const u8 {
+    return switch (representation) {
+        .identity => null,
+        .gzip => "gzip",
+        .brotli => "br",
+    };
+}
+
 fn prepareEventResponse(
     context: *EventWorkerContext,
     root: Io.Dir,
@@ -1256,6 +1387,7 @@ fn prepareEventResponse(
     start: Io.Timestamp,
 ) !void {
     var keep_open = requestWantsKeepAlive(request, context.config, current_request_count);
+    const is_head = std.mem.eql(u8, request.method, "HEAD");
     if (request.has_request_body) {
         try queueEventMemoryResponse(
             context,
@@ -1270,14 +1402,13 @@ fn prepareEventResponse(
             .{ .code = 400, .reason = "Bad Request" },
             "text/plain; charset=utf-8",
             "Bad request\n",
-            true,
+            !is_head,
             &.{},
             .{},
         );
         return;
     }
 
-    const is_head = std.mem.eql(u8, request.method, "HEAD");
     if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
         keep_open = false;
         try queueEventMemoryResponse(
@@ -1351,11 +1482,100 @@ fn prepareEventPath(
     keep_open: bool,
     is_head: bool,
     start: Io.Timestamp,
-) !void {
+) anyerror!void {
     const response_connection = if (keep_open) "keep-alive" else "close";
-    const cached = try context.cache_view.?.tryPrepareEventResponse(
+    var brotli_buffer: [max_request_bytes + 3]u8 = undefined;
+    var gzip_buffer: [max_request_bytes + 3]u8 = undefined;
+    const choice = switch (try selectRepresentation(
+        context.cache_view.?,
+        context.io,
         root,
         relative_path,
+        request.accept_encoding,
+        context.config,
+        &brotli_buffer,
+        &gzip_buffer,
+    )) {
+        .selected => |selected| selected,
+        .directory => return prepareEventDirectory(
+            context,
+            root,
+            conn,
+            request,
+            relative_path,
+            request_end,
+            current_request_count,
+            keep_open,
+            is_head,
+            start,
+        ),
+        .forbidden => {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 403, .reason = "Forbidden" },
+                "text/plain; charset=utf-8",
+                "Forbidden\n",
+                !is_head,
+                &.{},
+                .{},
+            );
+            return;
+        },
+        .not_found => {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 404, .reason = "Not Found" },
+                "text/plain; charset=utf-8",
+                "Not found\n",
+                !is_head,
+                &.{},
+                .{},
+            );
+            return;
+        },
+        .not_acceptable => {
+            try queueEventMemoryResponse(
+                context,
+                conn,
+                request_end,
+                current_request_count,
+                keep_open,
+                start,
+                request.method,
+                request.target,
+                request.user_agent,
+                .{ .code = 406, .reason = "Not Acceptable" },
+                "text/plain; charset=utf-8",
+                "Not acceptable\n",
+                !is_head,
+                &.{},
+                .{ .vary_accept_encoding = true },
+            );
+            return;
+        },
+    };
+
+    const cached = try context.cache_view.?.prepare(
+        root,
+        relative_path,
+        choice.physical_path,
+        choice.representation,
         request.if_none_match,
         request.if_modified_since,
         request.range,
@@ -1377,7 +1597,7 @@ fn prepareEventPath(
         return;
     }
 
-    var file = root.openFile(context.io, relative_path, .{
+    var file = root.openFile(context.io, choice.physical_path, .{
         .mode = .read_only,
         .allow_directory = false,
         .resolve_beneath = true,
@@ -1402,44 +1622,18 @@ fn prepareEventPath(
             );
             return;
         },
-        error.IsDir => {
-            if (context.config.trailing_slash_redirect and !targetPathHasTrailingSlash(request.target)) {
-                const location = try slashRedirectLocation(context.allocator, request.target);
-                defer context.allocator.free(location);
-                try queueEventMemoryResponse(
-                    context,
-                    conn,
-                    request_end,
-                    current_request_count,
-                    keep_open,
-                    start,
-                    request.method,
-                    request.target,
-                    request.user_agent,
-                    .{ .code = 308, .reason = "Permanent Redirect" },
-                    "text/plain; charset=utf-8",
-                    "Redirecting\n",
-                    !is_head,
-                    context.config.headers,
-                    .{ .location = location },
-                );
-                return;
-            }
-            const index_path = try std.fs.path.join(context.allocator, &.{ relative_path, "index.html" });
-            defer context.allocator.free(index_path);
-            return prepareEventPath(
-                context,
-                root,
-                conn,
-                request,
-                index_path,
-                request_end,
-                current_request_count,
-                keep_open,
-                is_head,
-                start,
-            );
-        },
+        error.IsDir => return prepareEventDirectory(
+            context,
+            root,
+            conn,
+            request,
+            relative_path,
+            request_end,
+            current_request_count,
+            keep_open,
+            is_head,
+            start,
+        ),
         error.AccessDenied => {
             try queueEventMemoryResponse(
                 context,
@@ -1493,7 +1687,10 @@ fn prepareEventPath(
     var last_modified_buffer: [64]u8 = undefined;
     const last_modified = if (context.config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
     var etag_buffer: [128]u8 = undefined;
-    const etag = if (context.config.etag) formatWeakEtag(stat.mtime.nanoseconds, stat.size, "identity", &etag_buffer) else null;
+    const etag = if (context.config.etag)
+        formatWeakEtag(stat.mtime.nanoseconds, stat.size, representationName(choice.representation), &etag_buffer)
+    else
+        null;
     if (isNotModified(request.if_none_match, request.if_modified_since, etag, stat.mtime.toSeconds(), context.config.last_modified)) {
         file.close(context.io);
         file_owned = false;
@@ -1512,7 +1709,12 @@ fn prepareEventPath(
             "",
             false,
             context.config.headers,
-            .{ .last_modified = last_modified, .etag = etag },
+            .{
+                .last_modified = last_modified,
+                .etag = etag,
+                .content_encoding = representationEncoding(choice.representation),
+                .vary_accept_encoding = context.config.precompressed,
+            },
         );
         return;
     }
@@ -1547,6 +1749,7 @@ fn prepareEventPath(
                         .etag = etag,
                         .accept_ranges = true,
                         .content_range = content_range,
+                        .vary_accept_encoding = context.config.precompressed,
                     },
                 );
                 return;
@@ -1578,6 +1781,8 @@ fn prepareEventPath(
             .etag = etag,
             .accept_ranges = context.config.range_requests,
             .content_range = content_range,
+            .content_encoding = representationEncoding(choice.representation),
+            .vary_accept_encoding = context.config.precompressed,
         },
     );
     errdefer context.allocator.free(header);
@@ -1599,6 +1804,57 @@ fn prepareEventPath(
     };
     setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, response_status.code, if (is_head) 0 else response_size);
     file_owned = false;
+}
+
+fn prepareEventDirectory(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    conn: *EventConnection,
+    request: Request,
+    relative_path: []const u8,
+    request_end: usize,
+    current_request_count: u32,
+    keep_open: bool,
+    is_head: bool,
+    start: Io.Timestamp,
+) !void {
+    if (context.config.trailing_slash_redirect and !targetPathHasTrailingSlash(request.target)) {
+        const location = try slashRedirectLocation(context.allocator, request.target);
+        defer context.allocator.free(location);
+        try queueEventMemoryResponse(
+            context,
+            conn,
+            request_end,
+            current_request_count,
+            keep_open,
+            start,
+            request.method,
+            request.target,
+            request.user_agent,
+            .{ .code = 308, .reason = "Permanent Redirect" },
+            "text/plain; charset=utf-8",
+            "Redirecting\n",
+            !is_head,
+            context.config.headers,
+            .{ .location = location },
+        );
+        return;
+    }
+
+    const index_path = try std.fs.path.join(context.allocator, &.{ relative_path, "index.html" });
+    defer context.allocator.free(index_path);
+    return prepareEventPath(
+        context,
+        root,
+        conn,
+        request,
+        index_path,
+        request_end,
+        current_request_count,
+        keep_open,
+        is_head,
+        start,
+    );
 }
 
 fn queueEventMemoryResponse(
@@ -1909,14 +2165,14 @@ fn processParsedRequest(
 ) !ProcessRequestResult {
     var keep_open = requestWantsKeepAlive(request, config, current_request_count);
     const response_connection = if (keep_open) "keep-alive" else "close";
+    const is_head = std.mem.eql(u8, request.method, "HEAD");
 
     if (request.has_request_body) {
-        const result = try sendSimple(out, stream_writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
+        const result = try sendSimpleForMethod(out, stream_writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close", is_head, .{});
         finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, result);
         return .{ .keep_open = false };
     }
 
-    const is_head = std.mem.eql(u8, request.method, "HEAD");
     if (!is_head and !std.mem.eql(u8, request.method, "GET")) {
         keep_open = false;
         try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
@@ -1930,7 +2186,7 @@ fn processParsedRequest(
     defer if (relative_path_owned) |path| allocator.free(path);
     const relative_path = normalizeTargetFast(request.target, config.dotfiles) orelse blk: {
         relative_path_owned = normalizeTarget(allocator, request.target, config.dotfiles) catch {
-            const result = try sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
+            const result = try sendSimpleForMethod(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection, is_head, .{});
             finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, result);
             return .{ .keep_open = keep_open };
         };
@@ -1950,6 +2206,7 @@ fn processParsedRequest(
         request.if_modified_since,
         request.range,
         request.if_range,
+        request.accept_encoding,
         is_head,
         response_connection,
         config,
@@ -2084,23 +2341,71 @@ fn servePath(
     if_modified_since: ?[]const u8,
     range_value: ?[]const u8,
     if_range: ?[]const u8,
+    accept_encoding: ?[]const u8,
     is_head: bool,
     connection: []const u8,
     config: Config,
     logger: *Logger,
     cache: *CacheView,
 ) !ResponseResult {
-    if (try cache.tryServe(root, out, stream_writer, relative_path, if_none_match, if_modified_since, range_value, if_range, is_head, connection)) |result| {
+    var brotli_buffer: [max_request_bytes + 3]u8 = undefined;
+    var gzip_buffer: [max_request_bytes + 3]u8 = undefined;
+    const choice = switch (try selectRepresentation(
+        cache,
+        io,
+        root,
+        relative_path,
+        accept_encoding,
+        config,
+        &brotli_buffer,
+        &gzip_buffer,
+    )) {
+        .selected => |selected| selected,
+        .directory => {
+            if (config.trailing_slash_redirect and !targetPathHasTrailingSlash(request_target)) {
+                return sendRedirect(allocator, out, stream_writer, request_target, is_head, connection, config.headers);
+            }
+            const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
+            defer allocator.free(index_path);
+            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, range_value, if_range, accept_encoding, is_head, connection, config, logger, cache);
+        },
+        .forbidden => return sendSimpleForMethod(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection, is_head, .{}),
+        .not_found => return sendSimpleForMethod(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection, is_head, .{}),
+        .not_acceptable => return sendSimpleForMethod(
+            out,
+            stream_writer,
+            .{ .code = 406, .reason = "Not Acceptable" },
+            "Not acceptable\n",
+            connection,
+            is_head,
+            .{ .vary_accept_encoding = true },
+        ),
+    };
+
+    if (try cache.tryServeRepresentation(
+        root,
+        out,
+        stream_writer,
+        relative_path,
+        choice.physical_path,
+        choice.representation,
+        if_none_match,
+        if_modified_since,
+        range_value,
+        if_range,
+        is_head,
+        connection,
+    )) |result| {
         return result;
     }
 
-    var file = root.openFile(io, relative_path, .{
+    var file = root.openFile(io, choice.physical_path, .{
         .mode = .read_only,
         .allow_directory = false,
         .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
-            return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection);
+            return sendSimpleForMethod(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection, is_head, .{});
         },
         error.IsDir => {
             if (config.trailing_slash_redirect and !targetPathHasTrailingSlash(request_target)) {
@@ -2108,10 +2413,10 @@ fn servePath(
             }
             const index_path = try std.fs.path.join(allocator, &.{ relative_path, "index.html" });
             defer allocator.free(index_path);
-            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, range_value, if_range, is_head, connection, config, logger, cache);
+            return servePath(allocator, io, root, stream, out, stream_writer, index_path, request_target, if_none_match, if_modified_since, range_value, if_range, accept_encoding, is_head, connection, config, logger, cache);
         },
         error.AccessDenied => {
-            return sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection);
+            return sendSimpleForMethod(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", connection, is_head, .{});
         },
         else => return err,
     };
@@ -2119,14 +2424,17 @@ fn servePath(
 
     const stat = try file.stat(io);
     if (stat.kind != .file) {
-        return sendSimple(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection);
+        return sendSimpleForMethod(out, stream_writer, .{ .code = 404, .reason = "Not Found" }, "Not found\n", connection, is_head, .{});
     }
 
     const content_type = mimeType(relative_path);
     var last_modified_buffer: [64]u8 = undefined;
     const last_modified = if (config.last_modified) formatHttpDate(stat.mtime, &last_modified_buffer) else null;
     var etag_buffer: [128]u8 = undefined;
-    const etag = if (config.etag) formatWeakEtag(stat.mtime.nanoseconds, stat.size, "identity", &etag_buffer) else null;
+    const etag = if (config.etag)
+        formatWeakEtag(stat.mtime.nanoseconds, stat.size, representationName(choice.representation), &etag_buffer)
+    else
+        null;
     if (isNotModified(if_none_match, if_modified_since, etag, stat.mtime.toSeconds(), config.last_modified)) {
         try sendHeadersExtended(
             out,
@@ -2135,7 +2443,12 @@ fn servePath(
             0,
             connection,
             config.headers,
-            .{ .last_modified = last_modified, .etag = etag },
+            .{
+                .last_modified = last_modified,
+                .etag = etag,
+                .content_encoding = representationEncoding(choice.representation),
+                .vary_accept_encoding = config.precompressed,
+            },
         );
         try stream_writer.interface.flush();
         return .{ .status = 304, .bytes = 0 };
@@ -2161,6 +2474,7 @@ fn servePath(
                         .etag = etag,
                         .accept_ranges = true,
                         .content_range = content_range,
+                        .vary_accept_encoding = config.precompressed,
                     },
                 );
                 if (!is_head) try out.writeAll(body);
@@ -2195,6 +2509,8 @@ fn servePath(
             .etag = etag,
             .accept_ranges = config.range_requests,
             .content_range = content_range,
+            .content_encoding = representationEncoding(choice.representation),
+            .vary_accept_encoding = config.precompressed,
         },
     );
     if (!is_head) {
@@ -2263,6 +2579,29 @@ fn sendSimple(out: *Io.Writer, stream_writer: *Io.net.Stream.Writer, status: Res
     try out.writeAll(body);
     try stream_writer.interface.flush();
     return .{ .status = status.code, .bytes = body.len };
+}
+
+fn sendSimpleForMethod(
+    out: *Io.Writer,
+    stream_writer: *Io.net.Stream.Writer,
+    status: ResponseStatus,
+    body: []const u8,
+    connection: []const u8,
+    is_head: bool,
+    options: http.ResponseHeaderOptions,
+) !ResponseResult {
+    try sendHeadersExtended(
+        out,
+        status,
+        "text/plain; charset=utf-8",
+        body.len,
+        connection,
+        &.{},
+        options,
+    );
+    if (!is_head) try out.writeAll(body);
+    try stream_writer.interface.flush();
+    return .{ .status = status.code, .bytes = if (is_head) 0 else body.len };
 }
 
 fn sendRedirect(

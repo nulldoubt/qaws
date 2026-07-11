@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Added Brotli/gzip sidecar negotiation with q-values, variant cache keys and ETags, encoded ranges, and `406` handling.
 - Added configurable single byte ranges with `206`, `416`, suffix/open forms, date `If-Range`, and cached/sendfile support.
 - Added weak representation ETags with strict JSON control and `If-None-Match` precedence over date validators.
 - Rebuilt the memory cache around worker-local views, immutable generations, stat-first per-path refresh, and complete resident-byte accounting.
