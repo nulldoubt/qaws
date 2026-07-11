@@ -10,6 +10,7 @@
         "src",
         "public",
         "scripts",
+        "qaws.example.json",
         "CHANGELOG.md",
         "LICENSE",
         "README.md",

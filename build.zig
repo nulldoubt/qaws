@@ -26,10 +26,14 @@ const release_targets = [_]ReleaseTarget{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version_check = b.addSystemCommand(&.{ "sh", "scripts/check-version.sh" });
+    const version_check_step = b.step("check-version", "Check qaws version metadata for consistency");
+    version_check_step.dependOn(&version_check.step);
 
     const exe = addQawsExecutable(b, "qaws", target, optimize);
 
     b.installArtifact(exe);
+    b.getInstallStep().dependOn(&version_check.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -48,6 +52,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const test_cmd = b.addRunArtifact(unit_tests);
+    test_cmd.step.dependOn(&version_check.step);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_cmd.step);
 
@@ -67,6 +72,7 @@ pub fn build(b: *std.Build) void {
             .h_dir = .disabled,
             .compiler_rt_dyn_lib_dir = .disabled,
         });
+        install_artifact.step.dependOn(&version_check.step);
         release_step.dependOn(&install_artifact.step);
     }
 }

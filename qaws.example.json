@@ -1,0 +1,41 @@
+{
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 80
+  },
+  "serve": "./public",
+  "daemon": {
+    "enabled": false,
+    "pid_file": null,
+    "log_file": null
+  },
+  "logging": {
+    "format": "plain",
+    "access": true
+  },
+  "security": {
+    "dotfiles": "deny_except_well_known"
+  },
+  "cache": {
+    "enabled": true,
+    "max_file_bytes": 262144,
+    "max_total_bytes": 16777216,
+    "revalidate_ms": 1000
+  },
+  "headers": {
+    "Cache-Control": "public, max-age=3600"
+  },
+  "http": {
+    "last_modified": true,
+    "trailing_slash_redirect": true,
+    "keep_alive": true,
+    "sendfile": true,
+    "etag": true,
+    "range_requests": true,
+    "precompressed": true,
+    "keep_alive_timeout_ms": 5000,
+    "max_requests_per_connection": 1000,
+    "max_connections": 1024,
+    "workers": null
+  }
+}
