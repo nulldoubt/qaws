@@ -1,5 +1,9 @@
 # Changelog
 
+### 0.2.7
+
+- Bumped qaws version metadata, package metadata, Docker tags, and documentation to 0.2.7.
+
 ### 0.2.6
 
 - Added a prebuilt keep-alive `200` response blob for cached small-file event responses.

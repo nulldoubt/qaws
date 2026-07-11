@@ -13,7 +13,7 @@ That serves `./public` on `0.0.0.0:80`.
 
 ## Status
 
-qaws is currently `0.2.6`.
+qaws is currently `0.2.7`.
 
 It supports HTTP/1.1 `GET` and `HEAD`, HTTP keep-alive, ordered pipelining, event-worker backends on supported Unix platforms, a fixed worker fallback, a cached event-worker fast path for small files, async log writing, platform sendfile for uncached static files, directory `index.html` resolution, path traversal rejection, default request logging, explicit JSON config, and Unix-style daemon management with PID files. It does not do TLS, authentication, runtime compression, directory listings, reverse proxying, upload handling, or SPA fallback.
 
@@ -86,7 +86,7 @@ qaws version
 `qaws version` prints:
 
 ```text
-qaws 0.2.6
+qaws 0.2.7
 ```
 
 ## Serving Rules
@@ -175,7 +175,7 @@ qaws caches small static files by default. The cache stores file bodies up to `2
 
 On evented platforms, cached safe-path `GET`, `HEAD`, and `304` responses use a nonblocking event-worker fast path. The worker writes prebuilt headers and cached bodies from pending output state, then continues with the next pipelined request only after the current response is fully sent. Complex paths, redirects, errors, uncached files, and large sendfile responses keep using the normal response path.
 
-Cache settings are JSON-only in `0.2.6`:
+Cache settings are JSON-only in `0.2.7`:
 
 ```json
 {
@@ -375,21 +375,21 @@ ghcr.io/nulldoubt/qaws
 Tags:
 
 ```text
-0.2.6
+0.2.7
 latest
 ```
 
 Run the sample image:
 
 ```sh
-docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.6
+docker run --rm -p 8080:80 code.alkhatib.online/alkhatib/qaws:0.2.7
 curl -i http://127.0.0.1:8080/
 ```
 
 Run with your own static files:
 
 ```sh
-docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.6
+docker run --rm -p 8080:80 -v "$PWD/public:/public:ro" ghcr.io/nulldoubt/qaws:0.2.7
 ```
 
 The container keeps the normal qaws defaults: it serves `./public` from `0.0.0.0:80`. The image uses `/` as its working directory and includes the sample `public/` directory, so it also works without a bind mount.
@@ -412,8 +412,8 @@ Publish both registries with Buildx:
 Inspect the published manifests:
 
 ```sh
-docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.6
-docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.6
+docker buildx imagetools inspect code.alkhatib.online/alkhatib/qaws:0.2.7
+docker buildx imagetools inspect ghcr.io/nulldoubt/qaws:0.2.7
 ```
 
 ## Release Builds
@@ -436,18 +436,18 @@ Current practical server targets:
 
 | Target | Artifact |
 | --- | --- |
-| `x86_64-linux-musl` | `dist/qaws-0.2.6-x86_64-linux-musl` |
-| `x86_64-linux-gnu` | `dist/qaws-0.2.6-x86_64-linux-gnu` |
-| `aarch64-linux-musl` | `dist/qaws-0.2.6-aarch64-linux-musl` |
-| `aarch64-linux-gnu` | `dist/qaws-0.2.6-aarch64-linux-gnu` |
-| `arm-linux-musleabihf` | `dist/qaws-0.2.6-arm-linux-musleabihf` |
-| `riscv64-linux-musl` | `dist/qaws-0.2.6-riscv64-linux-musl` |
-| `aarch64-linux-android` | `dist/qaws-0.2.6-aarch64-linux-android` |
-| `aarch64-macos` | `dist/qaws-0.2.6-aarch64-macos` |
-| `x86_64-macos` | `dist/qaws-0.2.6-x86_64-macos` |
-| `x86_64-windows-gnu` | `dist/qaws-0.2.6-x86_64-windows-gnu.exe` |
-| `aarch64-windows-gnu` | `dist/qaws-0.2.6-aarch64-windows-gnu.exe` |
-| `x86_64-freebsd` | `dist/qaws-0.2.6-x86_64-freebsd` |
+| `x86_64-linux-musl` | `dist/qaws-0.2.7-x86_64-linux-musl` |
+| `x86_64-linux-gnu` | `dist/qaws-0.2.7-x86_64-linux-gnu` |
+| `aarch64-linux-musl` | `dist/qaws-0.2.7-aarch64-linux-musl` |
+| `aarch64-linux-gnu` | `dist/qaws-0.2.7-aarch64-linux-gnu` |
+| `arm-linux-musleabihf` | `dist/qaws-0.2.7-arm-linux-musleabihf` |
+| `riscv64-linux-musl` | `dist/qaws-0.2.7-riscv64-linux-musl` |
+| `aarch64-linux-android` | `dist/qaws-0.2.7-aarch64-linux-android` |
+| `aarch64-macos` | `dist/qaws-0.2.7-aarch64-macos` |
+| `x86_64-macos` | `dist/qaws-0.2.7-x86_64-macos` |
+| `x86_64-windows-gnu` | `dist/qaws-0.2.7-x86_64-windows-gnu.exe` |
+| `aarch64-windows-gnu` | `dist/qaws-0.2.7-aarch64-windows-gnu.exe` |
+| `x86_64-freebsd` | `dist/qaws-0.2.7-x86_64-freebsd` |
 
 The release matrix intentionally excludes targets that are not practical qaws server artifacts, including WASI, iOS, tvOS, watchOS, UEFI, GPU, console, freestanding, and similar non-server environments.
 
@@ -512,7 +512,7 @@ To compare cached and uncached static serving, run once with the default cache a
 { "cache": { "enabled": false } }
 ```
 
-For the small-file event fast path, compare `0.2.5` and `0.2.6` with access logs disabled and the same static file:
+For the small-file event fast path, compare `0.2.6` and `0.2.7` with access logs disabled and the same static file:
 
 ```sh
 wrk -t1 -c1 -d10s http://127.0.0.1:18086/
