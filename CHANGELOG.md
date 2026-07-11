@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Split configuration defaults, JSON types, validation, and protected-header policy into a focused Zig module.
 - Bumped qaws version metadata, package metadata, Docker tags, and documentation to 0.2.7.
 
 ### 0.2.6
