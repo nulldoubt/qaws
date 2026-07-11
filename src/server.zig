@@ -1571,7 +1571,7 @@ fn prepareEventPath(
         },
     };
 
-    const cached = try context.cache_view.?.prepareAt(
+    const cached = try context.cache_view.?.prepareBorrowedAt(
         root,
         relative_path,
         choice.physical_path,
@@ -1924,11 +1924,11 @@ fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection, 
     while (conn.pending.active() and !conn.pending.complete()) {
         if (pendingWriteSlice(&conn.pending) != null) {
             const n = writePendingFd(conn.stream.socket.handle, &conn.pending) catch |err| switch (err) {
-                error.WouldBlock => return true,
+                error.WouldBlock => return retainPendingWrite(conn),
                 error.BrokenPipe, error.ConnectionResetByPeer, error.SocketUnconnected, error.ConnectionAborted => return false,
                 else => return err,
             };
-            if (n == 0) return true;
+            if (n == 0) return retainPendingWrite(conn);
             advancePendingWrite(&conn.pending, n);
             conn.last_active = batch_now;
             continue;
@@ -1936,15 +1936,20 @@ fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection, 
 
         if (conn.pending.file_remaining != 0) {
             const keep_writing = try flushEventFileBody(context, conn, batch_now);
-            if (!keep_writing) return true;
+            if (!keep_writing) return retainPendingWrite(conn);
             continue;
         }
         break;
     }
 
     if (!conn.pending.active()) return true;
-    if (!conn.pending.complete()) return true;
+    if (!conn.pending.complete()) return retainPendingWrite(conn);
     return finishEventPendingWrite(context, conn, batch_now);
+}
+
+fn retainPendingWrite(conn: *EventConnection) bool {
+    if (conn.pending.cache_lease) |*lease| lease.retain();
+    return true;
 }
 
 fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection, batch_now: Io.Timestamp) !bool {

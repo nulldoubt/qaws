@@ -115,11 +115,20 @@ const ViewMap = std.HashMapUnmanaged(
 pub const CacheLease = struct {
     io: Io,
     generation: ?*Generation,
+    retained: bool = true,
+
+    pub fn retain(self: *CacheLease) void {
+        if (self.retained) return;
+        const generation = self.generation orelse return;
+        retainGeneration(generation);
+        self.retained = true;
+    }
 
     pub fn release(self: *CacheLease) void {
         const generation = self.generation orelse return;
         self.generation = null;
-        releaseGeneration(self.io, generation);
+        if (self.retained) releaseGeneration(self.io, generation);
+        self.retained = false;
     }
 };
 
@@ -373,7 +382,7 @@ pub const CacheView = struct {
         is_head: bool,
         connection: []const u8,
     ) !?CachedEventResponse {
-        return self.prepareAt(
+        return self.prepareInternal(
             root,
             logical_path,
             physical_path,
@@ -385,10 +394,11 @@ pub const CacheView = struct {
             is_head,
             connection,
             Io.Timestamp.now(self.io, .awake),
+            true,
         );
     }
 
-    pub fn prepareAt(
+    pub fn prepareBorrowedAt(
         self: *CacheView,
         root: Io.Dir,
         logical_path: []const u8,
@@ -402,6 +412,37 @@ pub const CacheView = struct {
         connection: []const u8,
         now: Io.Timestamp,
     ) !?CachedEventResponse {
+        return self.prepareInternal(
+            root,
+            logical_path,
+            physical_path,
+            representation,
+            if_none_match,
+            if_modified_since,
+            range_value,
+            if_range,
+            is_head,
+            connection,
+            now,
+            false,
+        );
+    }
+
+    fn prepareInternal(
+        self: *CacheView,
+        root: Io.Dir,
+        logical_path: []const u8,
+        physical_path: []const u8,
+        representation: Representation,
+        if_none_match: ?[]const u8,
+        if_modified_since: ?[]const u8,
+        range_value: ?[]const u8,
+        if_range: ?[]const u8,
+        is_head: bool,
+        connection: []const u8,
+        now: Io.Timestamp,
+        retain_response: bool,
+    ) !?CachedEventResponse {
         if (!self.cache.enabled) return null;
         const entry = try self.getOrCreateViewEntry(logical_path, physical_path, representation) orelse return null;
         const slot = entry.slot;
@@ -413,8 +454,12 @@ pub const CacheView = struct {
         self.syncEntry(entry);
 
         const generation = entry.generation orelse return null;
-        retainGeneration(generation);
-        var lease = CacheLease{ .io = self.io, .generation = generation };
+        if (retain_response) retainGeneration(generation);
+        var lease = CacheLease{
+            .io = self.io,
+            .generation = generation,
+            .retained = retain_response,
+        };
         errdefer lease.release();
         var response = cachedEventResponseFromSnapshot(
             self.cache.last_modified,
