@@ -81,12 +81,17 @@ const setFdNonblocking = platform.setFdNonblocking;
 const setFdCloseOnExec = platform.setFdCloseOnExec;
 const epollCreate = platform.epollCreate;
 const epollAdd = platform.epollAdd;
+const epollAddUserData = platform.epollAddUserData;
 const epollSetWriteInterest = platform.epollSetWriteInterest;
+const epollSetWriteInterestUserData = platform.epollSetWriteInterestUserData;
 const epollWait = platform.epollWait;
 const kqueueCreate = platform.kqueueCreate;
 const kqueueAdd = platform.kqueueAdd;
+const kqueueAddUserData = platform.kqueueAddUserData;
 const kqueueSetWriteInterest = platform.kqueueSetWriteInterest;
 const kqueueSetReadInterest = platform.kqueueSetReadInterest;
+const kqueueSetWriteInterestUserData = platform.kqueueSetWriteInterestUserData;
+const kqueueSetReadInterestUserData = platform.kqueueSetReadInterestUserData;
 const kqueueWait = platform.kqueueWait;
 const sendfileSupportedForOs = platform.sendfileSupportedForOs;
 const trySendfile = platform.trySendfile;
@@ -97,6 +102,9 @@ pub const FileTransferPath = enum {
     buffered,
     sendfile,
 };
+
+const event_wake_token: usize = 1;
+const event_listener_token: usize = 2;
 
 const ConnectionContext = struct {
     allocator: Allocator,
@@ -137,11 +145,19 @@ pub const EventConnection = struct {
     remote_buffer: [128]u8 = undefined,
     remote_len: usize = 0,
     request_buffer: [max_request_bytes]u8 = undefined,
+    request_start: usize = 0,
     request_len: usize = 0,
     served_requests: u32 = 0,
     last_active: Io.Timestamp,
     pending: PendingEventWrite = .{},
     write_interest: bool = false,
+    closing: bool = false,
+    previous: ?*EventConnection = null,
+    next: ?*EventConnection = null,
+    retired_next: ?*EventConnection = null,
+    ready_previous: ?*EventConnection = null,
+    ready_next: ?*EventConnection = null,
+    ready_queued: bool = false,
 
     fn remote(self: *const EventConnection) []const u8 {
         return self.remote_buffer[0..self.remote_len];
@@ -149,6 +165,68 @@ pub const EventConnection = struct {
 
     fn hasPendingWrite(self: *const EventConnection) bool {
         return self.pending.active();
+    }
+};
+
+const EventReadyQueue = struct {
+    head: ?*EventConnection = null,
+    tail: ?*EventConnection = null,
+    count: usize = 0,
+
+    fn enqueue(self: *EventReadyQueue, conn: *EventConnection) void {
+        if (conn.ready_queued or conn.closing) return;
+        conn.ready_previous = self.tail;
+        conn.ready_next = null;
+        if (self.tail) |tail| tail.ready_next = conn else self.head = conn;
+        self.tail = conn;
+        conn.ready_queued = true;
+        self.count += 1;
+    }
+
+    fn pop(self: *EventReadyQueue) ?*EventConnection {
+        const conn = self.head orelse return null;
+        self.remove(conn);
+        return conn;
+    }
+
+    fn remove(self: *EventReadyQueue, conn: *EventConnection) void {
+        if (!conn.ready_queued) return;
+        if (conn.ready_previous) |previous| {
+            previous.ready_next = conn.ready_next;
+        } else {
+            self.head = conn.ready_next;
+        }
+        if (conn.ready_next) |next| {
+            next.ready_previous = conn.ready_previous;
+        } else {
+            self.tail = conn.ready_previous;
+        }
+        conn.ready_previous = null;
+        conn.ready_next = null;
+        conn.ready_queued = false;
+        self.count -= 1;
+    }
+};
+
+const EventConnectionList = struct {
+    head: ?*EventConnection = null,
+
+    fn add(self: *EventConnectionList, conn: *EventConnection) void {
+        conn.previous = null;
+        conn.next = self.head;
+        if (self.head) |head| head.previous = conn;
+        self.head = conn;
+    }
+
+    fn remove(self: *EventConnectionList, conn: *EventConnection) void {
+        if (conn.previous) |previous| {
+            previous.next = conn.next;
+        } else {
+            self.head = conn.next;
+        }
+        if (conn.next) |next| next.previous = conn.previous;
+        conn.previous = null;
+        conn.next = null;
     }
 };
 
@@ -615,67 +693,69 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
     const epoll_fd = try epollCreate();
     defer closeFd(epoll_fd);
 
-    try epollAdd(epoll_fd, context.wake_read_fd);
-    if (context.listener) |listener| try epollAdd(epoll_fd, listener.socket.handle);
+    try epollAddUserData(epoll_fd, context.wake_read_fd, event_wake_token);
+    if (context.listener) |listener| try epollAddUserData(epoll_fd, listener.socket.handle, event_listener_token);
 
-    var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
-    defer {
-        closeAllEventConnections(context, &connections);
-        connections.deinit();
-    }
+    var connections = EventConnectionList{};
+    var ready = EventReadyQueue{};
+    var retired: ?*EventConnection = null;
+    defer closeAllEventConnections(context, &connections, &retired);
+    var next_idle_scan = nextIdleScan(context.io, context.config);
 
     var events: [128]std.os.linux.epoll_event = undefined;
     while (!shutdown_requested.load(.seq_cst)) {
-        const count = try epollWait(epoll_fd, &events, eventWaitTimeoutMs(context.config));
+        const count = try epollWait(epoll_fd, &events, if (ready.count != 0) 0 else eventWaitTimeoutMs(context.config));
         var index: usize = 0;
         while (index < count) : (index += 1) {
             const event = events[index];
-            const fd = event.data.fd;
-            if (fd == context.wake_read_fd) {
+            const token = event.data.ptr;
+            if (token == event_wake_token) {
                 drainWakeFd(context.wake_read_fd);
                 if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
                 continue;
             }
-            if (context.listener) |listener| {
-                if (fd == listener.socket.handle) {
-                    try acceptReadyEpoll(context, epoll_fd, &connections);
-                    continue;
-                }
-            }
-            if ((event.events & (std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP)) != 0) {
-                closeEventConnection(context, &connections, fd);
+            if (token == event_listener_token) {
+                try acceptReadyEpoll(context, epoll_fd, &connections);
                 continue;
             }
-            if (connections.get(fd)) |conn| {
-                var keep_open = true;
-                if ((event.events & std.os.linux.EPOLL.OUT) != 0 and conn.hasPendingWrite()) {
-                    keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
-                        if (!isNormalDisconnect(err)) {
-                            context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
-                        }
-                        break :blk false;
-                    };
-                }
-                if (keep_open and (event.events & std.os.linux.EPOLL.IN) != 0 and !conn.hasPendingWrite()) {
-                    keep_open = processEventConnection(context, root, conn) catch |err| blk: {
-                        if (!isNormalDisconnect(err)) {
-                            context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
-                        }
-                        break :blk false;
-                    };
-                }
-                if (!keep_open) {
-                    closeEventConnection(context, &connections, fd);
-                } else {
-                    syncEpollWriteInterest(epoll_fd, conn) catch |err| {
-                        context.logger.event("error", "epoll write interest failed: {s}", .{@errorName(err)}) catch {};
-                        closeEventConnection(context, &connections, fd);
-                    };
-                }
+            const conn: *EventConnection = @ptrFromInt(token);
+            if (conn.closing) continue;
+            ready.remove(conn);
+            if ((event.events & (std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP)) != 0) {
+                deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+                continue;
+            }
+            var keep_open = true;
+            if ((event.events & std.os.linux.EPOLL.OUT) != 0 and conn.hasPendingWrite()) {
+                keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                    if (!isNormalDisconnect(err)) {
+                        context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
+                    }
+                    break :blk false;
+                };
+            }
+            if (keep_open and (event.events & std.os.linux.EPOLL.IN) != 0 and !conn.hasPendingWrite()) {
+                keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                    if (!isNormalDisconnect(err)) {
+                        context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                    }
+                    break :blk false;
+                };
+            }
+            if (!keep_open) {
+                deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+            } else {
+                syncEpollWriteInterest(epoll_fd, conn) catch |err| {
+                    context.logger.event("error", "epoll write interest failed: {s}", .{@errorName(err)}) catch {};
+                    deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+                };
+                if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
             }
         }
         if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
-        closeExpiredEventConnections(context, &connections);
+        processReadyEpoll(context, root, epoll_fd, &connections, &ready, &retired);
+        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan);
+        destroyRetiredEventConnections(context, &retired);
     }
 }
 
@@ -683,74 +763,138 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
     const kq_fd = try kqueueCreate();
     defer closeFd(kq_fd);
 
-    try kqueueAdd(kq_fd, context.wake_read_fd);
-    if (context.listener) |listener| try kqueueAdd(kq_fd, listener.socket.handle);
+    try kqueueAddUserData(kq_fd, context.wake_read_fd, event_wake_token);
+    if (context.listener) |listener| try kqueueAddUserData(kq_fd, listener.socket.handle, event_listener_token);
 
-    var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
-    defer {
-        closeAllEventConnections(context, &connections);
-        connections.deinit();
-    }
+    var connections = EventConnectionList{};
+    var ready = EventReadyQueue{};
+    var retired: ?*EventConnection = null;
+    defer closeAllEventConnections(context, &connections, &retired);
+    var next_idle_scan = nextIdleScan(context.io, context.config);
 
     var events: [128]std.posix.Kevent = undefined;
     while (!shutdown_requested.load(.seq_cst)) {
-        const count = try kqueueWait(kq_fd, &events, eventWaitTimeoutMs(context.config));
+        const count = try kqueueWait(kq_fd, &events, if (ready.count != 0) 0 else eventWaitTimeoutMs(context.config));
         var index: usize = 0;
         while (index < count) : (index += 1) {
             const event = events[index];
-            const fd: std.posix.fd_t = @intCast(event.udata);
-            if (fd == context.wake_read_fd) {
+            const token: usize = @intCast(event.udata);
+            if (token == event_wake_token) {
                 drainWakeFd(context.wake_read_fd);
                 if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
                 continue;
             }
-            if (context.listener) |listener| {
-                if (fd == listener.socket.handle) {
-                    try acceptReadyKqueue(context, kq_fd, &connections);
-                    continue;
-                }
-            }
-            if ((event.flags & std.c.EV.ERROR) != 0) {
-                closeEventConnection(context, &connections, fd);
+            if (token == event_listener_token) {
+                try acceptReadyKqueue(context, kq_fd, &connections);
                 continue;
             }
-            if (connections.get(fd)) |conn| {
-                var keep_open = true;
-                if (event.filter == std.c.EVFILT.WRITE and conn.hasPendingWrite()) {
-                    keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
-                        if (!isNormalDisconnect(err)) {
-                            context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
-                        }
-                        break :blk false;
-                    };
-                }
-                if (keep_open and event.filter == std.c.EVFILT.READ and !conn.hasPendingWrite()) {
-                    keep_open = processEventConnection(context, root, conn) catch |err| blk: {
-                        if (!isNormalDisconnect(err)) {
-                            context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
-                        }
-                        break :blk false;
-                    };
-                }
-                if (!keep_open) {
-                    closeEventConnection(context, &connections, fd);
-                } else {
-                    syncKqueueWriteInterest(kq_fd, conn) catch |err| {
-                        context.logger.event("error", "kqueue write interest failed: {s}", .{@errorName(err)}) catch {};
-                        closeEventConnection(context, &connections, fd);
-                    };
-                }
+            const conn: *EventConnection = @ptrFromInt(token);
+            if (conn.closing) continue;
+            ready.remove(conn);
+            if ((event.flags & std.c.EV.ERROR) != 0) {
+                deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+                continue;
+            }
+            var keep_open = true;
+            if (event.filter == std.c.EVFILT.WRITE and conn.hasPendingWrite()) {
+                keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                    if (!isNormalDisconnect(err)) {
+                        context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
+                    }
+                    break :blk false;
+                };
+            }
+            if (keep_open and event.filter == std.c.EVFILT.READ and !conn.hasPendingWrite()) {
+                keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                    if (!isNormalDisconnect(err)) {
+                        context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
+                    }
+                    break :blk false;
+                };
+            }
+            if (!keep_open) {
+                deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+            } else {
+                syncKqueueWriteInterest(kq_fd, conn) catch |err| {
+                    context.logger.event("error", "kqueue write interest failed: {s}", .{@errorName(err)}) catch {};
+                    deferCloseEventConnection(context, &connections, &ready, &retired, conn);
+                };
+                if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
             }
         }
         if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
-        closeExpiredEventConnections(context, &connections);
+        processReadyKqueue(context, root, kq_fd, &connections, &ready, &retired);
+        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan);
+        destroyRetiredEventConnections(context, &retired);
+    }
+}
+
+fn processReadyEpoll(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    epoll_fd: std.posix.fd_t,
+    connections: *EventConnectionList,
+    ready: *EventReadyQueue,
+    retired: *?*EventConnection,
+) void {
+    const budget = ready.count;
+    var processed: usize = 0;
+    while (processed < budget) : (processed += 1) {
+        const conn = ready.pop() orelse return;
+        if (conn.closing) continue;
+        const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+            if (!isNormalDisconnect(err)) {
+                context.logger.event("error", "event ready connection failed: {s}", .{@errorName(err)}) catch {};
+            }
+            break :blk false;
+        };
+        if (!keep_open) {
+            deferCloseEventConnection(context, connections, ready, retired, conn);
+            continue;
+        }
+        syncEpollWriteInterest(epoll_fd, conn) catch |err| {
+            context.logger.event("error", "epoll write interest failed: {s}", .{@errorName(err)}) catch {};
+            deferCloseEventConnection(context, connections, ready, retired, conn);
+        };
+        if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
+    }
+}
+
+fn processReadyKqueue(
+    context: *EventWorkerContext,
+    root: Io.Dir,
+    kq_fd: std.posix.fd_t,
+    connections: *EventConnectionList,
+    ready: *EventReadyQueue,
+    retired: *?*EventConnection,
+) void {
+    const budget = ready.count;
+    var processed: usize = 0;
+    while (processed < budget) : (processed += 1) {
+        const conn = ready.pop() orelse return;
+        if (conn.closing) continue;
+        const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+            if (!isNormalDisconnect(err)) {
+                context.logger.event("error", "event ready connection failed: {s}", .{@errorName(err)}) catch {};
+            }
+            break :blk false;
+        };
+        if (!keep_open) {
+            deferCloseEventConnection(context, connections, ready, retired, conn);
+            continue;
+        }
+        syncKqueueWriteInterest(kq_fd, conn) catch |err| {
+            context.logger.event("error", "kqueue write interest failed: {s}", .{@errorName(err)}) catch {};
+            deferCloseEventConnection(context, connections, ready, retired, conn);
+        };
+        if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
     }
 }
 
 fn acceptReadyEpoll(
     context: *EventWorkerContext,
     epoll_fd: std.posix.fd_t,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
 ) !void {
     const listener = context.listener.?;
     var accepted: usize = 0;
@@ -764,27 +908,23 @@ fn acceptReadyEpoll(
             sendBusy(context.io, stream) catch {};
             continue;
         }
-        const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             stream.close(context.io);
             releaseConnection(context.active_connections);
             return err;
         };
-        connections.put(fd, conn) catch |err| {
+        epollAddUserData(epoll_fd, stream.socket.handle, @intFromPtr(conn)) catch |err| {
             destroyEventConnection(context, conn);
             return err;
         };
-        epollAdd(epoll_fd, fd) catch |err| {
-            closeEventConnection(context, connections, fd);
-            return err;
-        };
+        connections.add(conn);
     }
 }
 
 fn acceptReadyKqueue(
     context: *EventWorkerContext,
     kq_fd: std.posix.fd_t,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
 ) !void {
     const listener = context.listener.?;
     var accepted: usize = 0;
@@ -798,70 +938,58 @@ fn acceptReadyKqueue(
             sendBusy(context.io, stream) catch {};
             continue;
         }
-        const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             stream.close(context.io);
             releaseConnection(context.active_connections);
             return err;
         };
-        connections.put(fd, conn) catch |err| {
+        kqueueAddUserData(kq_fd, stream.socket.handle, @intFromPtr(conn)) catch |err| {
             destroyEventConnection(context, conn);
             return err;
         };
-        kqueueAdd(kq_fd, fd) catch |err| {
-            closeEventConnection(context, connections, fd);
-            return err;
-        };
+        connections.add(conn);
     }
 }
 
 fn registerQueuedEpoll(
     context: *EventWorkerContext,
     epoll_fd: std.posix.fd_t,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
 ) !void {
     while (context.queue.?.popAvailable()) |stream| {
-        const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
             stream.close(context.io);
             releaseConnection(context.active_connections);
             continue;
         };
-        connections.put(fd, conn) catch |err| {
+        epollAddUserData(epoll_fd, stream.socket.handle, @intFromPtr(conn)) catch |err| {
             destroyEventConnection(context, conn);
-            return err;
-        };
-        epollAdd(epoll_fd, fd) catch |err| {
-            closeEventConnection(context, connections, fd);
             context.logger.event("error", "epoll registration failed: {s}", .{@errorName(err)}) catch {};
             continue;
         };
+        connections.add(conn);
     }
 }
 
 fn registerQueuedKqueue(
     context: *EventWorkerContext,
     kq_fd: std.posix.fd_t,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
 ) !void {
     while (context.queue.?.popAvailable()) |stream| {
-        const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
             stream.close(context.io);
             releaseConnection(context.active_connections);
             continue;
         };
-        connections.put(fd, conn) catch |err| {
+        kqueueAddUserData(kq_fd, stream.socket.handle, @intFromPtr(conn)) catch |err| {
             destroyEventConnection(context, conn);
-            return err;
-        };
-        kqueueAdd(kq_fd, fd) catch |err| {
-            closeEventConnection(context, connections, fd);
             context.logger.event("error", "kqueue registration failed: {s}", .{@errorName(err)}) catch {};
             continue;
         };
+        connections.add(conn);
     }
 }
 
@@ -883,42 +1011,76 @@ fn destroyEventConnection(context: *EventWorkerContext, conn: *EventConnection) 
     context.allocator.destroy(conn);
 }
 
-fn closeEventConnection(
+fn deferCloseEventConnection(
     context: *EventWorkerContext,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
-    fd: std.posix.fd_t,
+    connections: *EventConnectionList,
+    ready: *EventReadyQueue,
+    retired: *?*EventConnection,
+    conn: *EventConnection,
 ) void {
-    if (connections.fetchRemove(fd)) |entry| {
-        destroyEventConnection(context, entry.value);
+    if (conn.closing) return;
+    ready.remove(conn);
+    connections.remove(conn);
+    conn.closing = true;
+    releasePendingResources(context, &conn.pending);
+    conn.pending = .{};
+    conn.stream.close(context.io);
+    releaseConnection(context.active_connections);
+    conn.retired_next = retired.*;
+    retired.* = conn;
+}
+
+fn destroyRetiredEventConnections(context: *EventWorkerContext, retired: *?*EventConnection) void {
+    var current = retired.*;
+    retired.* = null;
+    while (current) |conn| {
+        const next = conn.retired_next;
+        context.allocator.destroy(conn);
+        current = next;
     }
 }
 
 fn closeAllEventConnections(
     context: *EventWorkerContext,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
+    retired: *?*EventConnection,
 ) void {
-    var values = connections.valueIterator();
-    while (values.next()) |conn| {
-        destroyEventConnection(context, conn.*);
+    var current = connections.head;
+    connections.head = null;
+    while (current) |conn| {
+        const next = conn.next;
+        destroyEventConnection(context, conn);
+        current = next;
     }
-    connections.clearRetainingCapacity();
+    destroyRetiredEventConnections(context, retired);
 }
 
-fn closeExpiredEventConnections(
+fn nextIdleScan(io: Io, config: Config) Io.Timestamp {
+    return Io.Timestamp.now(io, .awake).addDuration(
+        Io.Duration.fromMilliseconds(@min(config.keep_alive_timeout_ms, @as(u32, 1000))),
+    );
+}
+
+fn scanExpiredEventConnections(
     context: *EventWorkerContext,
-    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+    connections: *EventConnectionList,
+    ready: *EventReadyQueue,
+    retired: *?*EventConnection,
+    next_scan: *Io.Timestamp,
 ) void {
     const now = Io.Timestamp.now(context.io, .awake);
-    while (true) {
-        var expired: ?std.posix.fd_t = null;
-        var iterator = connections.iterator();
-        while (iterator.next()) |entry| {
-            if (eventConnectionExpired(entry.value_ptr.*, now, context.config)) {
-                expired = entry.key_ptr.*;
-                break;
-            }
+    if (now.nanoseconds < next_scan.nanoseconds) return;
+    next_scan.* = now.addDuration(
+        Io.Duration.fromMilliseconds(@min(context.config.keep_alive_timeout_ms, @as(u32, 1000))),
+    );
+
+    var current = connections.head;
+    while (current) |conn| {
+        const next = conn.next;
+        if (eventConnectionExpired(conn, now, context.config)) {
+            deferCloseEventConnection(context, connections, ready, retired, conn);
         }
-        closeEventConnection(context, connections, expired orelse return);
+        current = next;
     }
 }
 
@@ -932,7 +1094,8 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
 
     while (true) {
         if (conn.request_len == conn.request_buffer.len) {
-            if (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n") == null) {
+            if (conn.request_start != 0) compactEventRequestBuffer(conn);
+            if (conn.request_len == conn.request_buffer.len and !hasCompleteBufferedRequest(conn)) {
                 try queueEventMemoryResponse(
                     context,
                     conn,
@@ -954,7 +1117,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                 );
                 return flushEventPendingWrite(context, conn);
             }
-            break;
+            if (conn.request_len == conn.request_buffer.len) break;
         }
         const n = readFd(conn.stream.socket.handle, conn.request_buffer[conn.request_len..]) catch |err| switch (err) {
             error.WouldBlock => break,
@@ -967,12 +1130,12 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
     }
 
     var processed_this_tick: usize = 0;
-    while (std.mem.indexOf(u8, conn.request_buffer[0..conn.request_len], "\r\n\r\n")) |header_end_rel| {
+    while (std.mem.indexOf(u8, conn.request_buffer[conn.request_start..conn.request_len], "\r\n\r\n")) |header_end_rel| {
         if (shutdown_requested.load(.seq_cst)) return false;
         if (processed_this_tick >= event_request_batch_limit) return true;
 
-        const request_end = header_end_rel + 4;
-        const request_bytes = conn.request_buffer[0..request_end];
+        const request_end = conn.request_start + header_end_rel + 4;
+        const request_bytes = conn.request_buffer[conn.request_start..request_end];
         const request = parseRequest(request_bytes) catch {
             try queueEventMemoryResponse(
                 context,
@@ -1012,7 +1175,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         if (conn.hasPendingWrite()) return true;
     }
 
-    if (conn.request_len == conn.request_buffer.len) {
+    if (conn.request_len == conn.request_buffer.len and !hasCompleteBufferedRequest(conn)) {
         try queueEventMemoryResponse(
             context,
             conn,
@@ -1035,6 +1198,24 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         return flushEventPendingWrite(context, conn);
     }
     return true;
+}
+
+fn hasCompleteBufferedRequest(conn: *const EventConnection) bool {
+    return std.mem.indexOf(u8, conn.request_buffer[conn.request_start..conn.request_len], "\r\n\r\n") != null;
+}
+
+fn compactEventRequestBuffer(conn: *EventConnection) void {
+    if (conn.request_start == 0) return;
+    const remaining = conn.request_len - conn.request_start;
+    if (remaining != 0) {
+        std.mem.copyForwards(
+            u8,
+            conn.request_buffer[0..remaining],
+            conn.request_buffer[conn.request_start..conn.request_len],
+        );
+    }
+    conn.request_start = 0;
+    conn.request_len = remaining;
 }
 
 fn prepareEventResponse(
@@ -1526,11 +1707,11 @@ fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection)
     const keep_open = conn.pending.keep_open;
     finishAccessLog(context.logger, context.io, conn.pending.access_start, &conn.pending.access_record);
 
-    const remaining = conn.request_len - request_end;
-    if (remaining != 0) {
-        std.mem.copyForwards(u8, conn.request_buffer[0..remaining], conn.request_buffer[request_end..conn.request_len]);
+    conn.request_start = request_end;
+    if (conn.request_start == conn.request_len) {
+        conn.request_start = 0;
+        conn.request_len = 0;
     }
-    conn.request_len = remaining;
     conn.served_requests = served_requests_after;
     conn.last_active = Io.Timestamp.now(context.io, .awake);
     releasePendingResources(context, &conn.pending);
@@ -1569,15 +1750,15 @@ fn writePendingFd(fd: std.posix.fd_t, pending: *const PendingEventWrite) !usize 
 fn syncEpollWriteInterest(epoll_fd: std.posix.fd_t, conn: *EventConnection) !void {
     const enabled = conn.hasPendingWrite();
     if (conn.write_interest == enabled) return;
-    try epollSetWriteInterest(epoll_fd, conn.stream.socket.handle, enabled);
+    try epollSetWriteInterestUserData(epoll_fd, conn.stream.socket.handle, @intFromPtr(conn), enabled);
     conn.write_interest = enabled;
 }
 
 fn syncKqueueWriteInterest(kq_fd: std.posix.fd_t, conn: *EventConnection) !void {
     const enabled = conn.hasPendingWrite();
     if (conn.write_interest == enabled) return;
-    try kqueueSetReadInterest(kq_fd, conn.stream.socket.handle, !enabled);
-    try kqueueSetWriteInterest(kq_fd, conn.stream.socket.handle, enabled);
+    try kqueueSetReadInterestUserData(kq_fd, conn.stream.socket.handle, @intFromPtr(conn), !enabled);
+    try kqueueSetWriteInterestUserData(kq_fd, conn.stream.socket.handle, @intFromPtr(conn), enabled);
     conn.write_interest = enabled;
 }
 
@@ -2024,4 +2205,33 @@ fn sendRedirect(
     if (!is_head) try out.writeAll(body);
     try stream_writer.interface.flush();
     return .{ .status = 308, .bytes = if (is_head) 0 else body.len };
+}
+
+test "event ready queue preserves order and supports removal" {
+    var first = EventConnection{ .stream = undefined, .last_active = undefined };
+    var second = EventConnection{ .stream = undefined, .last_active = undefined };
+    var third = EventConnection{ .stream = undefined, .last_active = undefined };
+    var queue = EventReadyQueue{};
+
+    queue.enqueue(&first);
+    queue.enqueue(&second);
+    queue.enqueue(&third);
+    queue.remove(&second);
+    try std.testing.expectEqual(@as(usize, 2), queue.count);
+    try std.testing.expectEqual(&first, queue.pop().?);
+    try std.testing.expectEqual(&third, queue.pop().?);
+    try std.testing.expect(queue.pop() == null);
+}
+
+test "event request offsets compact only when buffer space is needed" {
+    var conn = EventConnection{ .stream = undefined, .last_active = undefined };
+    const requests = "one\r\n\r\ntwo\r\n\r\n";
+    @memcpy(conn.request_buffer[0..requests.len], requests);
+    conn.request_start = 7;
+    conn.request_len = requests.len;
+
+    try std.testing.expect(hasCompleteBufferedRequest(&conn));
+    compactEventRequestBuffer(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.request_start);
+    try std.testing.expectEqualStrings("two\r\n\r\n", conn.request_buffer[0..conn.request_len]);
 }

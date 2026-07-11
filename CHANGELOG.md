@@ -2,6 +2,8 @@
 
 ### 0.2.7
 
+- Removed event hash lookups with pointer userdata, deferred connection destruction, and scheduled one-pass idle scans.
+- Fixed deep HTTP pipelines with offset-based request buffers and a fair internal ready queue after each 16-request batch.
 - Made cached, memory, buffered-file, and sendfile event responses fully resumable without blocking-mode socket toggles.
 - Moved accepting into bounded nonblocking per-worker `SO_REUSEPORT` listeners with automatic dispatcher fallback.
 - Selected automatic workers from the highest-capacity CPU cluster with portable logical-CPU fallback.

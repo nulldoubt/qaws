@@ -346,9 +346,13 @@ pub fn epollCreate() !std.posix.fd_t {
 }
 
 pub fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
+    return epollAddUserData(epoll_fd, fd, @intCast(fd));
+}
+
+pub fn epollAddUserData(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, user_data: usize) !void {
     var event = std.os.linux.epoll_event{
         .events = epollConnectionEvents(false),
-        .data = .{ .fd = fd },
+        .data = .{ .ptr = user_data },
     };
     const rc = std.os.linux.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
     switch (std.os.linux.errno(rc)) {
@@ -358,9 +362,13 @@ pub fn epollAdd(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
 }
 
 pub fn epollSetWriteInterest(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    return epollSetWriteInterestUserData(epoll_fd, fd, @intCast(fd), enabled);
+}
+
+pub fn epollSetWriteInterestUserData(epoll_fd: std.posix.fd_t, fd: std.posix.fd_t, user_data: usize, enabled: bool) !void {
     var event = std.os.linux.epoll_event{
         .events = epollConnectionEvents(enabled),
-        .data = .{ .fd = fd },
+        .data = .{ .ptr = user_data },
     };
     const rc = std.os.linux.epoll_ctl(epoll_fd, std.os.linux.EPOLL.CTL_MOD, fd, &event);
     switch (std.os.linux.errno(rc)) {
@@ -400,56 +408,68 @@ pub fn kqueueCreate() !std.posix.fd_t {
 }
 
 pub fn kqueueAdd(kq_fd: std.posix.fd_t, fd: std.posix.fd_t) !void {
+    return kqueueAddUserData(kq_fd, fd, @intCast(fd));
+}
+
+pub fn kqueueAddUserData(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, user_data: usize) !void {
     var changes = [_]std.posix.Kevent{.{
         .ident = @intCast(fd),
         .filter = std.c.EVFILT.READ,
         .flags = std.c.EV.ADD | std.c.EV.ENABLE,
         .fflags = 0,
         .data = 0,
-        .udata = @intCast(fd),
+        .udata = user_data,
     }};
     var ignored: [1]std.posix.Kevent = undefined;
     const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
     switch (std.posix.errno(rc)) {
         .SUCCESS => {},
-        .INTR => return kqueueAdd(kq_fd, fd),
+        .INTR => return kqueueAddUserData(kq_fd, fd, user_data),
         else => return error.Unexpected,
     }
 }
 
 pub fn kqueueSetWriteInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    return kqueueSetWriteInterestUserData(kq_fd, fd, @intCast(fd), enabled);
+}
+
+pub fn kqueueSetWriteInterestUserData(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, user_data: usize, enabled: bool) !void {
     var changes = [_]std.posix.Kevent{.{
         .ident = @intCast(fd),
         .filter = std.c.EVFILT.WRITE,
         .flags = if (enabled) std.c.EV.ADD | std.c.EV.ENABLE else std.c.EV.DELETE,
         .fflags = 0,
         .data = 0,
-        .udata = @intCast(fd),
+        .udata = user_data,
     }};
     var ignored: [1]std.posix.Kevent = undefined;
     const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
     switch (std.posix.errno(rc)) {
         .SUCCESS => {},
-        .INTR => return kqueueSetWriteInterest(kq_fd, fd, enabled),
+        .INTR => return kqueueSetWriteInterestUserData(kq_fd, fd, user_data, enabled),
         .NOENT => if (!enabled) return,
         else => return error.Unexpected,
     }
 }
 
 pub fn kqueueSetReadInterest(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, enabled: bool) !void {
+    return kqueueSetReadInterestUserData(kq_fd, fd, @intCast(fd), enabled);
+}
+
+pub fn kqueueSetReadInterestUserData(kq_fd: std.posix.fd_t, fd: std.posix.fd_t, user_data: usize, enabled: bool) !void {
     var changes = [_]std.posix.Kevent{.{
         .ident = @intCast(fd),
         .filter = std.c.EVFILT.READ,
         .flags = if (enabled) std.c.EV.ENABLE else std.c.EV.DISABLE,
         .fflags = 0,
         .data = 0,
-        .udata = @intCast(fd),
+        .udata = user_data,
     }};
     var ignored: [1]std.posix.Kevent = undefined;
     const rc = std.posix.system.kevent(kq_fd, changes[0..].ptr, @intCast(changes.len), &ignored, 0, null);
     switch (std.posix.errno(rc)) {
         .SUCCESS => {},
-        .INTR => return kqueueSetReadInterest(kq_fd, fd, enabled),
+        .INTR => return kqueueSetReadInterestUserData(kq_fd, fd, user_data, enabled),
         else => return error.Unexpected,
     }
 }
