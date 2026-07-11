@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Split worker queues, connection handling, event loops, and static response serving into a focused Zig module.
 - Split backend selection, event syscalls, descriptor helpers, and platform sendfile into a focused Zig module.
 - Split static cache ownership, snapshots, and prebuilt responses into a focused Zig module.
 - Split HTTP parsing, normalization, date handling, MIME detection, and header generation into a focused Zig module.
