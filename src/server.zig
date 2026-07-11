@@ -22,6 +22,7 @@ const default_cache_max_total_bytes = config_mod.default_cache_max_total_bytes;
 const default_cache_revalidate_ms = config_mod.default_cache_revalidate_ms;
 const worker_stack_size = 512 * 1024;
 pub const event_request_batch_limit = 16;
+const event_accept_batch_limit = 64;
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
 var sendfile_fallback_logged = std.atomic.Value(bool).init(false);
@@ -66,6 +67,7 @@ const WakePipe = platform.WakePipe;
 const selectRuntimeBackend = platform.selectRuntimeBackend;
 const runtimeBackendName = platform.runtimeBackendName;
 const detectPerformanceCpuCount = platform.detectPerformanceCpuCount;
+const acceptNonblocking = platform.acceptNonblocking;
 const createWakePipe = platform.createWakePipe;
 const closeWakePipe = platform.closeWakePipe;
 const wakeFd = platform.wakeFd;
@@ -120,7 +122,8 @@ const EventWorkerContext = struct {
     config: Config,
     logger: *Logger,
     cache: *StaticCache,
-    queue: *WorkerQueue,
+    queue: ?*WorkerQueue = null,
+    listener: ?*Io.net.Server = null,
     active_connections: *std.atomic.Value(u32),
     backend: RuntimeBackend,
     wake_read_fd: std.posix.fd_t,
@@ -260,13 +263,20 @@ pub fn serve(allocator: Allocator, io: Io, config: Config, logger: *Logger, cach
     root_check.close(io);
 
     var address = try IpAddress.parse(config.host, config.port);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-
     const backend = comptime selectRuntimeBackend(builtin.os.tag);
     return switch (backend) {
-        .worker => serveBlockingWorkers(allocator, io, config, logger, cache, &server, backend),
-        .epoll, .kqueue => serveEventWorkers(allocator, io, config, logger, cache, &server, backend),
+        .worker => {
+            var server = try address.listen(io, .{ .reuse_address = true });
+            defer server.deinit(io);
+            return serveBlockingWorkers(allocator, io, config, logger, cache, &server, backend);
+        },
+        .epoll, .kqueue => {
+            if (try serveEventWorkersReusePort(allocator, io, config, logger, cache, &address, backend)) return;
+            logger.event("warn", "SO_REUSEPORT listeners unavailable; using the dispatcher accept path", .{}) catch {};
+            var server = try address.listen(io, .{ .reuse_address = true });
+            defer server.deinit(io);
+            return serveEventWorkersDispatched(allocator, io, config, logger, cache, &server, backend);
+        },
     };
 }
 
@@ -343,7 +353,92 @@ fn serveBlockingWorkers(
     logger.event("info", "shutdown", .{}) catch {};
 }
 
-fn serveEventWorkers(
+fn serveEventWorkersReusePort(
+    allocator: Allocator,
+    io: Io,
+    config: Config,
+    logger: *Logger,
+    cache: *StaticCache,
+    address: *IpAddress,
+    backend: RuntimeBackend,
+) !bool {
+    const worker_count = resolveWorkerCount(io, config);
+    const servers = try allocator.alloc(Io.net.Server, worker_count);
+    defer allocator.free(servers);
+
+    var started_servers: usize = 0;
+    while (started_servers < worker_count) : (started_servers += 1) {
+        servers[started_servers] = address.listen(io, .{ .reuse_address = true }) catch |err| {
+            for (servers[0..started_servers]) |*server| server.deinit(io);
+            if (started_servers != 0 and shouldFallbackReusePort(err)) return false;
+            return err;
+        };
+    }
+    defer for (servers[0..started_servers]) |*server| server.deinit(io);
+
+    for (servers) |server| {
+        setFdNonblocking(server.socket.handle, true) catch return false;
+    }
+
+    const pipes = try allocator.alloc(WakePipe, worker_count);
+    defer allocator.free(pipes);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    const contexts = try allocator.alloc(EventWorkerContext, worker_count);
+    defer allocator.free(contexts);
+
+    var active_connections = std.atomic.Value(u32).init(0);
+    var started_pipes: usize = 0;
+    var started_workers: usize = 0;
+    errdefer {
+        shutdown_requested.store(true, .seq_cst);
+        for (pipes[0..started_pipes]) |pipe| wakeFd(pipe.write) catch {};
+        for (threads[0..started_workers]) |thread| thread.join();
+        for (pipes[0..started_pipes]) |pipe| closeWakePipe(pipe);
+    }
+
+    for (contexts, 0..) |*context, index| {
+        pipes[index] = try createWakePipe();
+        started_pipes += 1;
+        context.* = .{
+            .allocator = allocator,
+            .io = io,
+            .config = config,
+            .logger = logger,
+            .cache = cache,
+            .listener = &servers[index],
+            .active_connections = &active_connections,
+            .backend = backend,
+            .wake_read_fd = pipes[index].read,
+            .wake_write_fd = pipes[index].write,
+        };
+        threads[index] = try std.Thread.spawn(.{
+            .stack_size = worker_stack_size,
+            .allocator = allocator,
+        }, eventWorkerLoop, .{context});
+        started_workers += 1;
+    }
+
+    try logger.event("info", "serving {s} on {s}:{d} with {d} workers using {s}", .{ config.serve_dir, config.host, config.port, worker_count, runtimeBackendName(backend) });
+    for (threads[0..started_workers]) |thread| thread.join();
+    for (pipes[0..started_pipes]) |pipe| closeWakePipe(pipe);
+    logger.event("info", "shutdown", .{}) catch {};
+    return true;
+}
+
+pub fn shouldFallbackReusePort(err: anyerror) bool {
+    return switch (err) {
+        error.AddressInUse,
+        error.OptionUnsupported,
+        error.ProtocolUnsupportedBySystem,
+        error.ProtocolUnsupportedByAddressFamily,
+        error.SocketModeUnsupported,
+        => true,
+        else => false,
+    };
+}
+
+fn serveEventWorkersDispatched(
     allocator: Allocator,
     io: Io,
     config: Config,
@@ -507,6 +602,7 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
     defer closeFd(epoll_fd);
 
     try epollAdd(epoll_fd, context.wake_read_fd);
+    if (context.listener) |listener| try epollAdd(epoll_fd, listener.socket.handle);
 
     var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
     defer {
@@ -523,8 +619,14 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
             const fd = event.data.fd;
             if (fd == context.wake_read_fd) {
                 drainWakeFd(context.wake_read_fd);
-                try registerQueuedEpoll(context, epoll_fd, &connections);
+                if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
                 continue;
+            }
+            if (context.listener) |listener| {
+                if (fd == listener.socket.handle) {
+                    try acceptReadyEpoll(context, epoll_fd, &connections);
+                    continue;
+                }
             }
             if ((event.events & (std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP)) != 0) {
                 closeEventConnection(context, &connections, fd);
@@ -558,7 +660,7 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
                 }
             }
         }
-        try registerQueuedEpoll(context, epoll_fd, &connections);
+        if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
         closeExpiredEventConnections(context, &connections);
     }
 }
@@ -568,6 +670,7 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
     defer closeFd(kq_fd);
 
     try kqueueAdd(kq_fd, context.wake_read_fd);
+    if (context.listener) |listener| try kqueueAdd(kq_fd, listener.socket.handle);
 
     var connections = std.AutoHashMap(std.posix.fd_t, *EventConnection).init(context.allocator);
     defer {
@@ -584,8 +687,14 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
             const fd: std.posix.fd_t = @intCast(event.udata);
             if (fd == context.wake_read_fd) {
                 drainWakeFd(context.wake_read_fd);
-                try registerQueuedKqueue(context, kq_fd, &connections);
+                if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
                 continue;
+            }
+            if (context.listener) |listener| {
+                if (fd == listener.socket.handle) {
+                    try acceptReadyKqueue(context, kq_fd, &connections);
+                    continue;
+                }
             }
             if ((event.flags & std.c.EV.ERROR) != 0) {
                 closeEventConnection(context, &connections, fd);
@@ -619,8 +728,76 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
                 }
             }
         }
-        try registerQueuedKqueue(context, kq_fd, &connections);
+        if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
         closeExpiredEventConnections(context, &connections);
+    }
+}
+
+fn acceptReadyEpoll(
+    context: *EventWorkerContext,
+    epoll_fd: std.posix.fd_t,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) !void {
+    const listener = context.listener.?;
+    var accepted: usize = 0;
+    while (accepted < event_accept_batch_limit) : (accepted += 1) {
+        const stream = acceptNonblocking(listener.socket.handle) catch |err| switch (err) {
+            error.WouldBlock => return,
+            error.ConnectionAborted => continue,
+            else => return err,
+        };
+        if (!tryAcquireConnection(context.active_connections, context.config.max_connections)) {
+            sendBusy(context.io, stream) catch {};
+            continue;
+        }
+        const fd = stream.socket.handle;
+        const conn = createEventConnection(context, stream) catch |err| {
+            stream.close(context.io);
+            releaseConnection(context.active_connections);
+            return err;
+        };
+        connections.put(fd, conn) catch |err| {
+            destroyEventConnection(context, conn);
+            return err;
+        };
+        epollAdd(epoll_fd, fd) catch |err| {
+            closeEventConnection(context, connections, fd);
+            return err;
+        };
+    }
+}
+
+fn acceptReadyKqueue(
+    context: *EventWorkerContext,
+    kq_fd: std.posix.fd_t,
+    connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
+) !void {
+    const listener = context.listener.?;
+    var accepted: usize = 0;
+    while (accepted < event_accept_batch_limit) : (accepted += 1) {
+        const stream = acceptNonblocking(listener.socket.handle) catch |err| switch (err) {
+            error.WouldBlock => return,
+            error.ConnectionAborted => continue,
+            else => return err,
+        };
+        if (!tryAcquireConnection(context.active_connections, context.config.max_connections)) {
+            sendBusy(context.io, stream) catch {};
+            continue;
+        }
+        const fd = stream.socket.handle;
+        const conn = createEventConnection(context, stream) catch |err| {
+            stream.close(context.io);
+            releaseConnection(context.active_connections);
+            return err;
+        };
+        connections.put(fd, conn) catch |err| {
+            destroyEventConnection(context, conn);
+            return err;
+        };
+        kqueueAdd(kq_fd, fd) catch |err| {
+            closeEventConnection(context, connections, fd);
+            return err;
+        };
     }
 }
 
@@ -629,7 +806,7 @@ fn registerQueuedEpoll(
     epoll_fd: std.posix.fd_t,
     connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
 ) !void {
-    while (context.queue.popAvailable()) |stream| {
+    while (context.queue.?.popAvailable()) |stream| {
         const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
@@ -654,7 +831,7 @@ fn registerQueuedKqueue(
     kq_fd: std.posix.fd_t,
     connections: *std.AutoHashMap(std.posix.fd_t, *EventConnection),
 ) !void {
-    while (context.queue.popAvailable()) |stream| {
+    while (context.queue.?.popAvailable()) |stream| {
         const fd = stream.socket.handle;
         const conn = createEventConnection(context, stream) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};

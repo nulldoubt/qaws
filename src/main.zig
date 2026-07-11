@@ -153,6 +153,7 @@ const keepAliveTimeout = server.keepAliveTimeout;
 const readHttpRequest = server.readHttpRequest;
 const appendRequestChunk = server.appendRequestChunk;
 const selectFileTransferPath = server.selectFileTransferPath;
+const shouldFallbackReusePort = server.shouldFallbackReusePort;
 
 const CliError = error{
     MissingValue,
@@ -1106,6 +1107,12 @@ test "runtime backend selection follows supported platforms" {
     try std.testing.expectEqualStrings("epoll", runtimeBackendName(.epoll));
     try std.testing.expectEqualStrings("kqueue", runtimeBackendName(.kqueue));
     try std.testing.expectEqualStrings("worker", runtimeBackendName(.worker));
+}
+
+test "reuse port setup falls back only for unsupported listener errors" {
+    try std.testing.expect(shouldFallbackReusePort(error.AddressInUse));
+    try std.testing.expect(shouldFallbackReusePort(error.OptionUnsupported));
+    try std.testing.expect(!shouldFallbackReusePort(error.SystemResources));
 }
 
 test "worker queue push pop and close behavior" {

@@ -20,6 +20,60 @@ pub const WakePipe = struct {
     write: std.posix.fd_t,
 };
 
+pub fn acceptNonblocking(listener_fd: std.posix.fd_t) !Io.net.Stream {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.UnsupportedOperatingSystem;
+    }
+
+    var storage: std.posix.sockaddr.storage = undefined;
+    var address_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    const accepted_fd = while (true) {
+        const rc = std.posix.system.accept(listener_fd, @ptrCast(&storage), &address_len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break @as(std.posix.fd_t, @intCast(rc)),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNABORTED => return error.ConnectionAborted,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    };
+    errdefer closeFd(accepted_fd);
+
+    try setFdNonblocking(accepted_fd, true);
+    try setFdCloseOnExec(accepted_fd);
+    return .{ .socket = .{
+        .handle = accepted_fd,
+        .address = try ipAddressFromSockaddr(&storage),
+    } };
+}
+
+fn ipAddressFromSockaddr(storage: *const std.posix.sockaddr.storage) !Io.net.IpAddress {
+    const address: *const std.posix.sockaddr = @ptrCast(storage);
+    return switch (address.family) {
+        std.posix.AF.INET => blk: {
+            const ipv4: *const std.posix.sockaddr.in = @ptrCast(storage);
+            const bytes: *const [4]u8 = @ptrCast(&ipv4.addr);
+            break :blk .{ .ip4 = .{
+                .bytes = bytes.*,
+                .port = std.mem.bigToNative(u16, ipv4.port),
+            } };
+        },
+        std.posix.AF.INET6 => blk: {
+            const ipv6: *const std.posix.sockaddr.in6 = @ptrCast(storage);
+            break :blk .{ .ip6 = .{
+                .bytes = ipv6.addr,
+                .port = std.mem.bigToNative(u16, ipv6.port),
+                .flow = ipv6.flowinfo,
+                .interface = .{ .index = ipv6.scope_id },
+            } };
+        },
+        else => error.AddressFamilyUnsupported,
+    };
+}
+
 pub fn selectRuntimeBackend(os_tag: std.Target.Os.Tag) RuntimeBackend {
     return switch (os_tag) {
         .linux => .epoll,
