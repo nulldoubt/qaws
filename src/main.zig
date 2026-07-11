@@ -1596,7 +1596,7 @@ test "http keep-alive decisions follow protocol defaults" {
     try std.testing.expectEqual(HttpVersion.http_1_1, http11.version);
     try std.testing.expect(requestWantsKeepAlive(http11, .{}, 1));
 
-    const http11_close = try parseRequest("GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    const http11_close = try parseRequest("GET / HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n");
     try std.testing.expectEqual(ConnectionDirective.close, http11_close.connection);
     try std.testing.expect(!requestWantsKeepAlive(http11_close, .{}, 1));
 
@@ -1610,17 +1610,50 @@ test "http keep-alive decisions follow protocol defaults" {
 }
 
 test "connection header parsing is tokenized and close wins" {
-    const request = try parseRequest("GET / HTTP/1.1\r\nConnection: Upgrade, Keep-Alive\r\nConnection: close\r\n\r\n");
+    const request = try parseRequest("GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade, Keep-Alive\r\nConnection: close\r\n\r\n");
     try std.testing.expectEqual(ConnectionDirective.close, request.connection);
 
-    const body = try parseRequest("GET / HTTP/1.1\r\nContent-Length: 10\r\n\r\n");
-    try std.testing.expect(body.has_request_body);
+    try std.testing.expectError(
+        error.BadRequest,
+        parseRequest("GET / HTTP/1.1\r\nHost: example\r\nContent-Length: 10\r\n\r\n"),
+    );
 
     const disabled = Config{ .keep_alive = false };
-    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\n\r\n"), disabled, 1));
+    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\nHost: example\r\n\r\n"), disabled, 1));
 
     const capped = Config{ .max_requests_per_connection = 1 };
-    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\n\r\n"), capped, 1));
+    try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\nHost: example\r\n\r\n"), capped, 1));
+}
+
+test "request parser rejects malformed HTTP framing" {
+    try std.testing.expectError(error.BadRequest, parseRequest("GET / HTTP/1.1\r\n\r\n"));
+    try std.testing.expectError(error.BadRequest, parseRequest("GET / HTTP/1.1\r\nHost: \r\n\r\n"));
+    try std.testing.expectError(error.BadRequest, parseRequest("GET / HTTP/1.1\r\nHost: example\r\nBroken\r\n\r\n"));
+    try std.testing.expectError(
+        error.BadRequest,
+        parseRequest("GET / HTTP/1.1\r\nHost: example\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n"),
+    );
+    try std.testing.expectError(
+        error.BadRequest,
+        parseRequest("GET / HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: identity\r\n\r\n"),
+    );
+
+    _ = try parseRequest("GET / HTTP/1.1\r\nHost: example\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n");
+}
+
+test "request parser captures static conditional headers" {
+    const request = try parseRequest(
+        "GET / HTTP/1.1\r\n" ++
+            "Host: example\r\n" ++
+            "If-None-Match: W/\"abc\"\r\n" ++
+            "If-Range: Thu, 01 Jan 1970 00:00:00 GMT\r\n" ++
+            "Range: bytes=1-2\r\n" ++
+            "Accept-Encoding: br, gzip\r\n\r\n",
+    );
+    try std.testing.expectEqualStrings("W/\"abc\"", request.if_none_match.?);
+    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", request.if_range.?);
+    try std.testing.expectEqualStrings("bytes=1-2", request.range.?);
+    try std.testing.expectEqualStrings("br, gzip", request.accept_encoding.?);
 }
 
 test "request parser skips user agent when access logging is disabled" {

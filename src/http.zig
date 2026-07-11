@@ -24,6 +24,10 @@ pub const Request = struct {
     connection: ConnectionDirective = .none,
     user_agent: ?[]const u8 = null,
     if_modified_since: ?[]const u8 = null,
+    if_none_match: ?[]const u8 = null,
+    if_range: ?[]const u8 = null,
+    range: ?[]const u8 = null,
+    accept_encoding: ?[]const u8 = null,
     has_request_body: bool = false,
 };
 
@@ -42,14 +46,18 @@ pub fn parseRequest(bytes: []const u8) !Request {
 }
 
 pub fn parseRequestOptions(bytes: []const u8, capture_user_agent: bool) !Request {
+    if (!std.mem.endsWith(u8, bytes, "\r\n\r\n")) return error.BadRequest;
     const line_end = std.mem.indexOf(u8, bytes, "\r\n") orelse return error.BadRequest;
     const line = bytes[0..line_end];
 
-    var parts = std.mem.splitScalar(u8, line, ' ');
-    const method = parts.next() orelse return error.BadRequest;
-    const target = parts.next() orelse return error.BadRequest;
-    const version_text = parts.next() orelse return error.BadRequest;
-    if (parts.next() != null) return error.BadRequest;
+    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadRequest;
+    const second_space_rel = std.mem.indexOfScalar(u8, line[first_space + 1 ..], ' ') orelse return error.BadRequest;
+    const second_space = first_space + 1 + second_space_rel;
+    if (std.mem.indexOfScalar(u8, line[second_space + 1 ..], ' ') != null) return error.BadRequest;
+    const method = line[0..first_space];
+    const target = line[first_space + 1 .. second_space];
+    const version_text = line[second_space + 1 ..];
+    if (!isToken(method)) return error.BadRequest;
     const version_value: HttpVersion = if (std.mem.eql(u8, version_text, "HTTP/1.1"))
         .http_1_1
     else if (std.mem.eql(u8, version_text, "HTTP/1.0"))
@@ -57,37 +65,64 @@ pub fn parseRequestOptions(bytes: []const u8, capture_user_agent: bool) !Request
     else
         return error.BadRequest;
     if (target.len == 0 or target[0] != '/') return error.BadRequest;
+    for (target) |byte| if (byte <= 0x20 or byte == 0x7f) return error.BadRequest;
 
     var user_agent: ?[]const u8 = null;
     var if_modified_since: ?[]const u8 = null;
+    var if_none_match: ?[]const u8 = null;
+    var if_range: ?[]const u8 = null;
+    var range: ?[]const u8 = null;
+    var accept_encoding: ?[]const u8 = null;
     var connection: ConnectionDirective = .none;
-    var has_request_body = false;
+    var host_seen = false;
+    var content_length: ?u64 = null;
     var header_start = line_end + 2;
-    while (header_start < bytes.len) {
-        const header_end_rel = std.mem.indexOf(u8, bytes[header_start..], "\r\n") orelse break;
+    while (true) {
+        const header_end_rel = std.mem.indexOf(u8, bytes[header_start..], "\r\n") orelse return error.BadRequest;
         const header_end = header_start + header_end_rel;
-        if (header_end == header_start) break;
+        if (header_end == header_start) {
+            if (header_end + 2 != bytes.len) return error.BadRequest;
+            break;
+        }
         const header = bytes[header_start..header_end];
-        if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
-            const name = std.mem.trim(u8, header[0..colon], &std.ascii.whitespace);
-            const value = std.mem.trim(u8, header[colon + 1 ..], &std.ascii.whitespace);
-            if (capture_user_agent and std.ascii.eqlIgnoreCase(name, "User-Agent")) {
-                user_agent = value;
-            } else if (std.ascii.eqlIgnoreCase(name, "If-Modified-Since")) {
-                if_modified_since = value;
-            } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
-                connection = mergeConnectionDirective(connection, parseConnectionHeader(value));
-            } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
-                const length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
-                if (length > 0) has_request_body = true;
-            } else if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) {
-                if (value.len != 0 and !std.ascii.eqlIgnoreCase(value, "identity")) {
-                    has_request_body = true;
-                }
+        const colon = std.mem.indexOfScalar(u8, header, ':') orelse return error.BadRequest;
+        const name = header[0..colon];
+        const value = std.mem.trim(u8, header[colon + 1 ..], " \t");
+        if (!isToken(name) or !isValidHeaderValue(value)) return error.BadRequest;
+
+        if (std.ascii.eqlIgnoreCase(name, "Host")) {
+            if (host_seen or value.len == 0) return error.BadRequest;
+            host_seen = true;
+        } else if (capture_user_agent and std.ascii.eqlIgnoreCase(name, "User-Agent")) {
+            user_agent = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "If-Modified-Since")) {
+            if_modified_since = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "If-None-Match")) {
+            if_none_match = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "If-Range")) {
+            if_range = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "Range")) {
+            range = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "Accept-Encoding")) {
+            accept_encoding = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "Connection")) {
+            connection = mergeConnectionDirective(connection, parseConnectionHeader(value));
+        } else if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+            if (value.len == 0) return error.BadRequest;
+            for (value) |byte| if (!std.ascii.isDigit(byte)) return error.BadRequest;
+            const length = std.fmt.parseInt(u64, value, 10) catch return error.BadRequest;
+            if (content_length) |existing| {
+                if (existing != length) return error.BadRequest;
+            } else {
+                content_length = length;
             }
+        } else if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) {
+            return error.BadRequest;
         }
         header_start = header_end + 2;
     }
+    if (version_value == .http_1_1 and !host_seen) return error.BadRequest;
+    if ((content_length orelse 0) != 0) return error.BadRequest;
 
     return .{
         .method = method,
@@ -96,8 +131,27 @@ pub fn parseRequestOptions(bytes: []const u8, capture_user_agent: bool) !Request
         .connection = connection,
         .user_agent = user_agent,
         .if_modified_since = if_modified_since,
-        .has_request_body = has_request_body,
+        .if_none_match = if_none_match,
+        .if_range = if_range,
+        .range = range,
+        .accept_encoding = accept_encoding,
     };
+}
+
+fn isToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isValidHeaderValue(value: []const u8) bool {
+    for (value) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return false;
+    }
+    return true;
 }
 
 pub fn parseConnectionHeader(value: []const u8) ConnectionDirective {
