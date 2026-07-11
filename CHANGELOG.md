@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Removed access-record, user-agent, peer-formatting, and per-request timing work when access logging is disabled.
 - Removed event hash lookups with pointer userdata, deferred connection destruction, and scheduled one-pass idle scans.
 - Fixed deep HTTP pipelines with offset-based request buffers and a fair internal ready queue after each 16-request batch.
 - Made cached, memory, buffered-file, and sendfile event responses fully resumable without blocking-mode socket toggles.

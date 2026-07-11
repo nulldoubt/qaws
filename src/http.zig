@@ -38,6 +38,10 @@ pub const ResponseResult = struct {
 };
 
 pub fn parseRequest(bytes: []const u8) !Request {
+    return parseRequestOptions(bytes, true);
+}
+
+pub fn parseRequestOptions(bytes: []const u8, capture_user_agent: bool) !Request {
     const line_end = std.mem.indexOf(u8, bytes, "\r\n") orelse return error.BadRequest;
     const line = bytes[0..line_end];
 
@@ -67,7 +71,7 @@ pub fn parseRequest(bytes: []const u8) !Request {
         if (std.mem.indexOfScalar(u8, header, ':')) |colon| {
             const name = std.mem.trim(u8, header[0..colon], &std.ascii.whitespace);
             const value = std.mem.trim(u8, header[colon + 1 ..], &std.ascii.whitespace);
-            if (std.ascii.eqlIgnoreCase(name, "User-Agent")) {
+            if (capture_user_agent and std.ascii.eqlIgnoreCase(name, "User-Agent")) {
                 user_agent = value;
             } else if (std.ascii.eqlIgnoreCase(name, "If-Modified-Since")) {
                 if_modified_since = value;

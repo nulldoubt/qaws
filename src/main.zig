@@ -93,6 +93,7 @@ const Request = http.Request;
 const ResponseStatus = http.ResponseStatus;
 const ResponseResult = http.ResponseResult;
 const parseRequest = http.parseRequest;
+const parseRequestOptions = http.parseRequestOptions;
 const parseConnectionHeader = http.parseConnectionHeader;
 const requestWantsKeepAlive = http.requestWantsKeepAlive;
 const normalizeTarget = http.normalizeTarget;
@@ -1620,6 +1621,14 @@ test "connection header parsing is tokenized and close wins" {
 
     const capped = Config{ .max_requests_per_connection = 1 };
     try std.testing.expect(!requestWantsKeepAlive(try parseRequest("GET / HTTP/1.1\r\n\r\n"), capped, 1));
+}
+
+test "request parser skips user agent when access logging is disabled" {
+    const request = try parseRequestOptions(
+        "GET / HTTP/1.1\r\nHost: example\r\nUser-Agent: benchmark\r\n\r\n",
+        false,
+    );
+    try std.testing.expect(request.user_agent == null);
 }
 
 test "http date parsing and slash redirect locations" {

@@ -46,6 +46,7 @@ const Request = http.Request;
 const ResponseStatus = http.ResponseStatus;
 const ResponseResult = http.ResponseResult;
 const parseRequest = http.parseRequest;
+const parseRequestOptions = http.parseRequestOptions;
 const parseConnectionHeader = http.parseConnectionHeader;
 const requestWantsKeepAlive = http.requestWantsKeepAlive;
 const normalizeTarget = http.normalizeTarget;
@@ -247,6 +248,7 @@ pub const PendingEventWrite = struct {
     file_buffer_offset: usize = 0,
     file_buffer_len: usize = 0,
     use_sendfile: bool = false,
+    access_enabled: bool = false,
     access_start: Io.Timestamp = undefined,
     access_record: AccessRecord = undefined,
 
@@ -700,22 +702,23 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
     var ready = EventReadyQueue{};
     var retired: ?*EventConnection = null;
     defer closeAllEventConnections(context, &connections, &retired);
-    var next_idle_scan = nextIdleScan(context.io, context.config);
+    var next_idle_scan = nextIdleScan(Io.Timestamp.now(context.io, .awake), context.config);
 
     var events: [128]std.os.linux.epoll_event = undefined;
     while (!shutdown_requested.load(.seq_cst)) {
         const count = try epollWait(epoll_fd, &events, if (ready.count != 0) 0 else eventWaitTimeoutMs(context.config));
+        const batch_now = Io.Timestamp.now(context.io, .awake);
         var index: usize = 0;
         while (index < count) : (index += 1) {
             const event = events[index];
             const token = event.data.ptr;
             if (token == event_wake_token) {
                 drainWakeFd(context.wake_read_fd);
-                if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
+                if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections, batch_now);
                 continue;
             }
             if (token == event_listener_token) {
-                try acceptReadyEpoll(context, epoll_fd, &connections);
+                try acceptReadyEpoll(context, epoll_fd, &connections, batch_now);
                 continue;
             }
             const conn: *EventConnection = @ptrFromInt(token);
@@ -727,7 +730,7 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
             }
             var keep_open = true;
             if ((event.events & std.os.linux.EPOLL.OUT) != 0 and conn.hasPendingWrite()) {
-                keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                keep_open = flushEventPendingWrite(context, conn, batch_now) catch |err| blk: {
                     if (!isNormalDisconnect(err)) {
                         context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
                     }
@@ -735,7 +738,7 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
                 };
             }
             if (keep_open and (event.events & std.os.linux.EPOLL.IN) != 0 and !conn.hasPendingWrite()) {
-                keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                keep_open = processEventConnection(context, root, conn, batch_now) catch |err| blk: {
                     if (!isNormalDisconnect(err)) {
                         context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
                     }
@@ -752,9 +755,9 @@ fn eventWorkerLoopEpoll(context: *EventWorkerContext, root: Io.Dir) !void {
                 if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
             }
         }
-        if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections);
-        processReadyEpoll(context, root, epoll_fd, &connections, &ready, &retired);
-        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan);
+        if (context.queue != null) try registerQueuedEpoll(context, epoll_fd, &connections, batch_now);
+        processReadyEpoll(context, root, epoll_fd, &connections, &ready, &retired, batch_now);
+        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan, batch_now);
         destroyRetiredEventConnections(context, &retired);
     }
 }
@@ -770,22 +773,23 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
     var ready = EventReadyQueue{};
     var retired: ?*EventConnection = null;
     defer closeAllEventConnections(context, &connections, &retired);
-    var next_idle_scan = nextIdleScan(context.io, context.config);
+    var next_idle_scan = nextIdleScan(Io.Timestamp.now(context.io, .awake), context.config);
 
     var events: [128]std.posix.Kevent = undefined;
     while (!shutdown_requested.load(.seq_cst)) {
         const count = try kqueueWait(kq_fd, &events, if (ready.count != 0) 0 else eventWaitTimeoutMs(context.config));
+        const batch_now = Io.Timestamp.now(context.io, .awake);
         var index: usize = 0;
         while (index < count) : (index += 1) {
             const event = events[index];
             const token: usize = @intCast(event.udata);
             if (token == event_wake_token) {
                 drainWakeFd(context.wake_read_fd);
-                if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
+                if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections, batch_now);
                 continue;
             }
             if (token == event_listener_token) {
-                try acceptReadyKqueue(context, kq_fd, &connections);
+                try acceptReadyKqueue(context, kq_fd, &connections, batch_now);
                 continue;
             }
             const conn: *EventConnection = @ptrFromInt(token);
@@ -797,7 +801,7 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
             }
             var keep_open = true;
             if (event.filter == std.c.EVFILT.WRITE and conn.hasPendingWrite()) {
-                keep_open = flushEventPendingWrite(context, conn) catch |err| blk: {
+                keep_open = flushEventPendingWrite(context, conn, batch_now) catch |err| blk: {
                     if (!isNormalDisconnect(err)) {
                         context.logger.event("error", "event response write failed: {s}", .{@errorName(err)}) catch {};
                     }
@@ -805,7 +809,7 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
                 };
             }
             if (keep_open and event.filter == std.c.EVFILT.READ and !conn.hasPendingWrite()) {
-                keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+                keep_open = processEventConnection(context, root, conn, batch_now) catch |err| blk: {
                     if (!isNormalDisconnect(err)) {
                         context.logger.event("error", "event connection failed: {s}", .{@errorName(err)}) catch {};
                     }
@@ -822,9 +826,9 @@ fn eventWorkerLoopKqueue(context: *EventWorkerContext, root: Io.Dir) !void {
                 if (!conn.closing and !conn.hasPendingWrite() and hasCompleteBufferedRequest(conn)) ready.enqueue(conn);
             }
         }
-        if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections);
-        processReadyKqueue(context, root, kq_fd, &connections, &ready, &retired);
-        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan);
+        if (context.queue != null) try registerQueuedKqueue(context, kq_fd, &connections, batch_now);
+        processReadyKqueue(context, root, kq_fd, &connections, &ready, &retired, batch_now);
+        scanExpiredEventConnections(context, &connections, &ready, &retired, &next_idle_scan, batch_now);
         destroyRetiredEventConnections(context, &retired);
     }
 }
@@ -836,13 +840,14 @@ fn processReadyEpoll(
     connections: *EventConnectionList,
     ready: *EventReadyQueue,
     retired: *?*EventConnection,
+    batch_now: Io.Timestamp,
 ) void {
     const budget = ready.count;
     var processed: usize = 0;
     while (processed < budget) : (processed += 1) {
         const conn = ready.pop() orelse return;
         if (conn.closing) continue;
-        const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+        const keep_open = processEventConnection(context, root, conn, batch_now) catch |err| blk: {
             if (!isNormalDisconnect(err)) {
                 context.logger.event("error", "event ready connection failed: {s}", .{@errorName(err)}) catch {};
             }
@@ -867,13 +872,14 @@ fn processReadyKqueue(
     connections: *EventConnectionList,
     ready: *EventReadyQueue,
     retired: *?*EventConnection,
+    batch_now: Io.Timestamp,
 ) void {
     const budget = ready.count;
     var processed: usize = 0;
     while (processed < budget) : (processed += 1) {
         const conn = ready.pop() orelse return;
         if (conn.closing) continue;
-        const keep_open = processEventConnection(context, root, conn) catch |err| blk: {
+        const keep_open = processEventConnection(context, root, conn, batch_now) catch |err| blk: {
             if (!isNormalDisconnect(err)) {
                 context.logger.event("error", "event ready connection failed: {s}", .{@errorName(err)}) catch {};
             }
@@ -895,6 +901,7 @@ fn acceptReadyEpoll(
     context: *EventWorkerContext,
     epoll_fd: std.posix.fd_t,
     connections: *EventConnectionList,
+    batch_now: Io.Timestamp,
 ) !void {
     const listener = context.listener.?;
     var accepted: usize = 0;
@@ -908,7 +915,7 @@ fn acceptReadyEpoll(
             sendBusy(context.io, stream) catch {};
             continue;
         }
-        const conn = createEventConnection(context, stream) catch |err| {
+        const conn = createEventConnection(context, stream, batch_now) catch |err| {
             stream.close(context.io);
             releaseConnection(context.active_connections);
             return err;
@@ -925,6 +932,7 @@ fn acceptReadyKqueue(
     context: *EventWorkerContext,
     kq_fd: std.posix.fd_t,
     connections: *EventConnectionList,
+    batch_now: Io.Timestamp,
 ) !void {
     const listener = context.listener.?;
     var accepted: usize = 0;
@@ -938,7 +946,7 @@ fn acceptReadyKqueue(
             sendBusy(context.io, stream) catch {};
             continue;
         }
-        const conn = createEventConnection(context, stream) catch |err| {
+        const conn = createEventConnection(context, stream, batch_now) catch |err| {
             stream.close(context.io);
             releaseConnection(context.active_connections);
             return err;
@@ -955,9 +963,10 @@ fn registerQueuedEpoll(
     context: *EventWorkerContext,
     epoll_fd: std.posix.fd_t,
     connections: *EventConnectionList,
+    batch_now: Io.Timestamp,
 ) !void {
     while (context.queue.?.popAvailable()) |stream| {
-        const conn = createEventConnection(context, stream) catch |err| {
+        const conn = createEventConnection(context, stream, batch_now) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
             stream.close(context.io);
             releaseConnection(context.active_connections);
@@ -976,9 +985,10 @@ fn registerQueuedKqueue(
     context: *EventWorkerContext,
     kq_fd: std.posix.fd_t,
     connections: *EventConnectionList,
+    batch_now: Io.Timestamp,
 ) !void {
     while (context.queue.?.popAvailable()) |stream| {
-        const conn = createEventConnection(context, stream) catch |err| {
+        const conn = createEventConnection(context, stream, batch_now) catch |err| {
             context.logger.event("error", "event connection allocation failed: {s}", .{@errorName(err)}) catch {};
             stream.close(context.io);
             releaseConnection(context.active_connections);
@@ -993,14 +1003,19 @@ fn registerQueuedKqueue(
     }
 }
 
-fn createEventConnection(context: *EventWorkerContext, stream: Io.net.Stream) !*EventConnection {
+fn createEventConnection(context: *EventWorkerContext, stream: Io.net.Stream, batch_now: Io.Timestamp) !*EventConnection {
     const conn = try context.allocator.create(EventConnection);
     conn.* = .{
         .stream = stream,
-        .last_active = Io.Timestamp.now(context.io, .awake),
+        .last_active = batch_now,
     };
-    const remote = formatRemoteAddress(stream.socket.address, &conn.remote_buffer);
-    conn.remote_len = remote.len;
+    if (context.logger.access_enabled) {
+        const remote = formatRemoteAddress(stream.socket.address, &conn.remote_buffer);
+        conn.remote_len = remote.len;
+    } else {
+        conn.remote_buffer[0] = '-';
+        conn.remote_len = 1;
+    }
     return conn;
 }
 
@@ -1055,8 +1070,8 @@ fn closeAllEventConnections(
     destroyRetiredEventConnections(context, retired);
 }
 
-fn nextIdleScan(io: Io, config: Config) Io.Timestamp {
-    return Io.Timestamp.now(io, .awake).addDuration(
+fn nextIdleScan(now: Io.Timestamp, config: Config) Io.Timestamp {
+    return now.addDuration(
         Io.Duration.fromMilliseconds(@min(config.keep_alive_timeout_ms, @as(u32, 1000))),
     );
 }
@@ -1067,17 +1082,17 @@ fn scanExpiredEventConnections(
     ready: *EventReadyQueue,
     retired: *?*EventConnection,
     next_scan: *Io.Timestamp,
+    batch_now: Io.Timestamp,
 ) void {
-    const now = Io.Timestamp.now(context.io, .awake);
-    if (now.nanoseconds < next_scan.nanoseconds) return;
-    next_scan.* = now.addDuration(
+    if (batch_now.nanoseconds < next_scan.nanoseconds) return;
+    next_scan.* = batch_now.addDuration(
         Io.Duration.fromMilliseconds(@min(context.config.keep_alive_timeout_ms, @as(u32, 1000))),
     );
 
     var current = connections.head;
     while (current) |conn| {
         const next = conn.next;
-        if (eventConnectionExpired(conn, now, context.config)) {
+        if (eventConnectionExpired(conn, batch_now, context.config)) {
             deferCloseEventConnection(context, connections, ready, retired, conn);
         }
         current = next;
@@ -1089,8 +1104,8 @@ pub fn eventConnectionExpired(conn: *const EventConnection, now: Io.Timestamp, c
     return idle_ms >= config.keep_alive_timeout_ms;
 }
 
-fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *EventConnection) !bool {
-    if (conn.hasPendingWrite()) return flushEventPendingWrite(context, conn);
+fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *EventConnection, batch_now: Io.Timestamp) !bool {
+    if (conn.hasPendingWrite()) return flushEventPendingWrite(context, conn, batch_now);
 
     while (true) {
         if (conn.request_len == conn.request_buffer.len) {
@@ -1102,7 +1117,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                     conn.request_len,
                     conn.served_requests,
                     false,
-                    Io.Timestamp.now(context.io, .awake),
+                    batch_now,
                     "-",
                     "-",
                     null,
@@ -1115,7 +1130,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                     null,
                     null,
                 );
-                return flushEventPendingWrite(context, conn);
+                return flushEventPendingWrite(context, conn, batch_now);
             }
             if (conn.request_len == conn.request_buffer.len) break;
         }
@@ -1126,7 +1141,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
         };
         if (n == 0) return false;
         conn.request_len += n;
-        conn.last_active = Io.Timestamp.now(context.io, .awake);
+        conn.last_active = batch_now;
     }
 
     var processed_this_tick: usize = 0;
@@ -1136,14 +1151,14 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
 
         const request_end = conn.request_start + header_end_rel + 4;
         const request_bytes = conn.request_buffer[conn.request_start..request_end];
-        const request = parseRequest(request_bytes) catch {
+        const request = parseRequestOptions(request_bytes, context.logger.access_enabled) catch {
             try queueEventMemoryResponse(
                 context,
                 conn,
                 request_end,
                 conn.served_requests,
                 false,
-                Io.Timestamp.now(context.io, .awake),
+                batch_now,
                 "-",
                 "-",
                 null,
@@ -1156,7 +1171,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
                 null,
                 null,
             );
-            return flushEventPendingWrite(context, conn);
+            return flushEventPendingWrite(context, conn, batch_now);
         };
 
         const current_request_count = conn.served_requests + 1;
@@ -1167,10 +1182,10 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
             request,
             request_end,
             current_request_count,
-            Io.Timestamp.now(context.io, .awake),
+            batch_now,
         );
         processed_this_tick += 1;
-        const keep_open = try flushEventPendingWrite(context, conn);
+        const keep_open = try flushEventPendingWrite(context, conn, batch_now);
         if (!keep_open) return false;
         if (conn.hasPendingWrite()) return true;
     }
@@ -1182,7 +1197,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
             conn.request_len,
             conn.served_requests,
             false,
-            Io.Timestamp.now(context.io, .awake),
+            batch_now,
             "-",
             "-",
             null,
@@ -1195,7 +1210,7 @@ fn processEventConnection(context: *EventWorkerContext, root: Io.Dir, conn: *Eve
             null,
             null,
         );
-        return flushEventPendingWrite(context, conn);
+        return flushEventPendingWrite(context, conn, batch_now);
     }
     return true;
 }
@@ -1346,17 +1361,8 @@ fn prepareEventPath(
             .request_end = request_end,
             .served_requests_after = current_request_count,
             .keep_open = keep_open,
-            .access_start = start,
-            .access_record = .{
-                .remote = conn.remote(),
-                .method = request.method,
-                .target = request.target,
-                .status = response.status,
-                .bytes = response.bytes,
-                .duration_us = 0,
-                .user_agent = request.user_agent,
-            },
         };
+        setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, response.status, response.bytes);
         return;
     }
 
@@ -1540,17 +1546,8 @@ fn prepareEventPath(
         .file = if (is_head) null else file,
         .file_remaining = if (is_head) 0 else stat.size,
         .use_sendfile = !is_head and context.config.sendfile and sendfileSupportedForOs(builtin.os.tag),
-        .access_start = start,
-        .access_record = .{
-            .remote = conn.remote(),
-            .method = request.method,
-            .target = request.target,
-            .status = 200,
-            .bytes = if (is_head) 0 else stat.size,
-            .duration_us = 0,
-            .user_agent = request.user_agent,
-        },
     };
+    setPendingAccess(context, conn, start, request.method, request.target, request.user_agent, 200, if (is_head) 0 else stat.size);
     file_owned = false;
 }
 
@@ -1592,20 +1589,35 @@ fn queueEventMemoryResponse(
         .served_requests_after = served_requests_after,
         .keep_open = keep_open,
         .owns_header = true,
-        .access_start = start,
-        .access_record = .{
-            .remote = conn.remote(),
-            .method = method,
-            .target = target,
-            .status = status.code,
-            .bytes = if (send_body) body.len else 0,
-            .duration_us = 0,
-            .user_agent = user_agent,
-        },
+    };
+    setPendingAccess(context, conn, start, method, target, user_agent, status.code, if (send_body) body.len else 0);
+}
+
+fn setPendingAccess(
+    context: *EventWorkerContext,
+    conn: *EventConnection,
+    start: Io.Timestamp,
+    method: []const u8,
+    target: []const u8,
+    user_agent: ?[]const u8,
+    status: u16,
+    bytes: u64,
+) void {
+    if (!context.logger.access_enabled) return;
+    conn.pending.access_enabled = true;
+    conn.pending.access_start = start;
+    conn.pending.access_record = .{
+        .remote = conn.remote(),
+        .method = method,
+        .target = target,
+        .status = status,
+        .bytes = bytes,
+        .duration_us = 0,
+        .user_agent = user_agent,
     };
 }
 
-fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) !bool {
+fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection, batch_now: Io.Timestamp) !bool {
     while (conn.pending.active() and !conn.pending.complete()) {
         if (pendingWriteSlice(&conn.pending) != null) {
             const n = writePendingFd(conn.stream.socket.handle, &conn.pending) catch |err| switch (err) {
@@ -1615,12 +1627,12 @@ fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) 
             };
             if (n == 0) return true;
             advancePendingWrite(&conn.pending, n);
-            conn.last_active = Io.Timestamp.now(context.io, .awake);
+            conn.last_active = batch_now;
             continue;
         }
 
         if (conn.pending.file_remaining != 0) {
-            const keep_writing = try flushEventFileBody(context, conn);
+            const keep_writing = try flushEventFileBody(context, conn, batch_now);
             if (!keep_writing) return true;
             continue;
         }
@@ -1629,10 +1641,10 @@ fn flushEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) 
 
     if (!conn.pending.active()) return true;
     if (!conn.pending.complete()) return true;
-    return finishEventPendingWrite(context, conn);
+    return finishEventPendingWrite(context, conn, batch_now);
 }
 
-fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection) !bool {
+fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection, batch_now: Io.Timestamp) !bool {
     const pending = &conn.pending;
     const file = pending.file orelse return error.Unexpected;
 
@@ -1642,7 +1654,7 @@ fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection) !boo
                 if (written == 0) return error.EndOfStream;
                 pending.file_offset += written;
                 pending.file_remaining -= written;
-                conn.last_active = Io.Timestamp.now(context.io, .awake);
+                conn.last_active = batch_now;
                 return true;
             },
             .would_block => return false,
@@ -1677,7 +1689,7 @@ fn flushEventFileBody(context: *EventWorkerContext, conn: *EventConnection) !boo
     pending.file_buffer_offset += written;
     pending.file_offset += written;
     pending.file_remaining -= written;
-    conn.last_active = Io.Timestamp.now(context.io, .awake);
+    conn.last_active = batch_now;
     return true;
 }
 
@@ -1701,11 +1713,13 @@ pub fn advancePendingWrite(pending: *PendingEventWrite, written: usize) void {
     }
 }
 
-fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection) bool {
+fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection, batch_now: Io.Timestamp) bool {
     const request_end = conn.pending.request_end;
     const served_requests_after = conn.pending.served_requests_after;
     const keep_open = conn.pending.keep_open;
-    finishAccessLog(context.logger, context.io, conn.pending.access_start, &conn.pending.access_record);
+    if (conn.pending.access_enabled) {
+        finishAccessLogAt(context.logger, conn.pending.access_start, batch_now, &conn.pending.access_record);
+    }
 
     conn.request_start = request_end;
     if (conn.request_start == conn.request_len) {
@@ -1713,7 +1727,7 @@ fn finishEventPendingWrite(context: *EventWorkerContext, conn: *EventConnection)
         conn.request_len = 0;
     }
     conn.served_requests = served_requests_after;
-    conn.last_active = Io.Timestamp.now(context.io, .awake);
+    conn.last_active = batch_now;
     releasePendingResources(context, &conn.pending);
     conn.pending = .{};
     return keep_open;
@@ -1777,7 +1791,7 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
     defer stream.close(io);
 
     var remote_buffer: [128]u8 = undefined;
-    const remote = formatRemoteAddress(stream.socket.address, &remote_buffer);
+    const remote = if (logger.access_enabled) formatRemoteAddress(stream.socket.address, &remote_buffer) else "-";
 
     var reader_buffer: [4096]u8 = undefined;
     var reader = ConnectionReader.init(io, stream, &reader_buffer);
@@ -1788,40 +1802,25 @@ fn handleConnection(allocator: Allocator, io: Io, root: Io.Dir, stream: Io.net.S
     var served_requests: u32 = 0;
 
     while (!shutdown_requested.load(.seq_cst)) {
-        const start = Io.Timestamp.now(io, .awake);
-        var access_record = AccessRecord{
-            .remote = remote,
-            .method = "-",
-            .target = "-",
-            .status = 500,
-            .bytes = 0,
-            .duration_us = 0,
-            .user_agent = null,
-        };
+        const start: ?Io.Timestamp = if (logger.access_enabled) Io.Timestamp.now(io, .awake) else null;
 
         const request_bytes = readHttpRequest(&reader, keepAliveTimeout(config), &request_buffer) catch |err| switch (err) {
             error.Timeout, error.EndOfStream, error.ConnectionResetByPeer, error.SocketUnconnected => return,
             error.RequestTooLarge => {
                 const result = try sendSimple(out, &writer, .{ .code = 413, .reason = "Payload Too Large" }, "Request too large\n", "close");
-                access_record.status = result.status;
-                access_record.bytes = result.bytes;
-                finishAccessLog(logger, io, start, &access_record);
+                finishBlockingAccess(logger, io, start, remote, "-", "-", null, result);
                 return;
             },
             else => {
                 const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
-                access_record.status = result.status;
-                access_record.bytes = result.bytes;
-                finishAccessLog(logger, io, start, &access_record);
+                finishBlockingAccess(logger, io, start, remote, "-", "-", null, result);
                 return;
             },
         };
 
-        const request = parseRequest(request_bytes) catch {
+        const request = parseRequestOptions(request_bytes, logger.access_enabled) catch {
             const result = try sendSimple(out, &writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
-            access_record.status = result.status;
-            access_record.bytes = result.bytes;
-            finishAccessLog(logger, io, start, &access_record);
+            finishBlockingAccess(logger, io, start, remote, "-", "-", null, result);
             return;
         };
         const current_request_count = served_requests + 1;
@@ -1859,26 +1858,14 @@ fn processParsedRequest(
     logger: *Logger,
     cache: *StaticCache,
     current_request_count: u32,
-    start: Io.Timestamp,
+    start: ?Io.Timestamp,
 ) !ProcessRequestResult {
-    var access_record = AccessRecord{
-        .remote = remote,
-        .method = request.method,
-        .target = request.target,
-        .status = 500,
-        .bytes = 0,
-        .duration_us = 0,
-        .user_agent = request.user_agent,
-    };
-
     var keep_open = requestWantsKeepAlive(request, config, current_request_count);
     const response_connection = if (keep_open) "keep-alive" else "close";
 
     if (request.has_request_body) {
         const result = try sendSimple(out, stream_writer, .{ .code = 400, .reason = "Bad Request" }, "Bad request\n", "close");
-        access_record.status = result.status;
-        access_record.bytes = result.bytes;
-        finishAccessLog(logger, io, start, &access_record);
+        finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, result);
         return .{ .keep_open = false };
     }
 
@@ -1888,9 +1875,7 @@ fn processParsedRequest(
         try sendHeaders(out, .{ .code = 405, .reason = "Method Not Allowed" }, "text/plain; charset=utf-8", 19, "close", "GET, HEAD", &.{}, null, null);
         try out.writeAll("Method not allowed\n");
         try stream_writer.interface.flush();
-        access_record.status = 405;
-        access_record.bytes = 19;
-        finishAccessLog(logger, io, start, &access_record);
+        finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, .{ .status = 405, .bytes = 19 });
         return .{ .keep_open = false };
     }
 
@@ -1899,9 +1884,7 @@ fn processParsedRequest(
     const relative_path = normalizeTargetFast(request.target, config.dotfiles) orelse blk: {
         relative_path_owned = normalizeTarget(allocator, request.target, config.dotfiles) catch {
             const result = try sendSimple(out, stream_writer, .{ .code = 403, .reason = "Forbidden" }, "Forbidden\n", response_connection);
-            access_record.status = result.status;
-            access_record.bytes = result.bytes;
-            finishAccessLog(logger, io, start, &access_record);
+            finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, result);
             return .{ .keep_open = keep_open };
         };
         break :blk relative_path_owned.?;
@@ -1923,39 +1906,39 @@ fn processParsedRequest(
         logger,
         cache,
     );
-    access_record.status = result.status;
-    access_record.bytes = result.bytes;
-    finishAccessLog(logger, io, start, &access_record);
+    finishBlockingAccess(logger, io, start, remote, request.method, request.target, request.user_agent, result);
     return .{ .keep_open = keep_open };
 }
 
-fn sendRequestError(
-    io: Io,
+fn finishBlockingAccess(
     logger: *Logger,
-    out: *Io.Writer,
-    stream_writer: *Io.net.Stream.Writer,
+    io: Io,
+    start: ?Io.Timestamp,
     remote: []const u8,
-    status: ResponseStatus,
-    body: []const u8,
-    start: Io.Timestamp,
-) !void {
+    method: []const u8,
+    target: []const u8,
+    user_agent: ?[]const u8,
+    result: ResponseResult,
+) void {
+    const started = start orelse return;
     var access_record = AccessRecord{
         .remote = remote,
-        .method = "-",
-        .target = "-",
-        .status = status.code,
-        .bytes = 0,
+        .method = method,
+        .target = target,
+        .status = result.status,
+        .bytes = result.bytes,
         .duration_us = 0,
-        .user_agent = null,
+        .user_agent = user_agent,
     };
-    const result = try sendSimple(out, stream_writer, status, body, "close");
-    access_record.status = result.status;
-    access_record.bytes = result.bytes;
-    finishAccessLog(logger, io, start, &access_record);
+    finishAccessLog(logger, io, started, &access_record);
 }
 
 fn finishAccessLog(logger: *Logger, io: Io, start: Io.Timestamp, record: *AccessRecord) void {
     const end = Io.Timestamp.now(io, .awake);
+    finishAccessLogAt(logger, start, end, record);
+}
+
+fn finishAccessLogAt(logger: *Logger, start: Io.Timestamp, end: Io.Timestamp, record: *AccessRecord) void {
     record.duration_us = start.durationTo(end).toMicroseconds();
     logger.access(record.*);
 }
