@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Included the release-version consistency check in multi-platform Docker builds.
 - Replaced 64-bit cache-control atomics with worker-local deadlines and 32-bit-safe generation versions.
 - Stabilized slow-reader integration coverage under host scheduling and memory pressure.
 - Made precompressed-sidecar integration checks deterministic across slow and fast hosts.

@@ -25,7 +25,9 @@ ENV PATH="/opt/zig:${PATH}"
 WORKDIR /src
 
 COPY build.zig build.zig.zon ./
+COPY README.md CHANGELOG.md ./
 COPY src ./src
+COPY scripts/check-version.sh scripts/docker-build-push.sh ./scripts/
 COPY public ./public
 
 RUN set -eu; \
