@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Removed global slot-map locking from established worker-local cache hits.
 - Added repeatable end-to-end coverage for strict HTTP, 64-request pipelines, partial writes, cache refresh, overload, fallbacks, and daemon control.
 - Documented modern validators, ranges, sidecar negotiation, topology-aware workers, and resumable event transfers.
 - Added a complete example JSON configuration and an automated release-version consistency check.

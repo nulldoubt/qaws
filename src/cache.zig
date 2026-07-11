@@ -374,13 +374,8 @@ pub const CacheView = struct {
         connection: []const u8,
     ) !?CachedEventResponse {
         if (!self.cache.enabled) return null;
-        const slot = try self.cache.getOrCreateSlot(
-            self.io,
-            logical_path,
-            physical_path,
-            representation,
-        ) orelse return null;
-        const entry = try self.viewEntry(slot);
+        const entry = try self.getOrCreateViewEntry(logical_path, physical_path, representation) orelse return null;
+        const slot = entry.slot;
 
         const now = Io.Timestamp.now(self.io, .awake);
         const now_ms = timestampMilliseconds(now);
@@ -421,18 +416,31 @@ pub const CacheView = struct {
         representation: Representation,
     ) !Availability {
         if (!self.cache.enabled) return .unknown;
-        const slot = try self.cache.getOrCreateSlot(
-            self.io,
-            logical_path,
-            physical_path,
-            representation,
-        ) orelse return .unknown;
+        const entry = try self.getOrCreateViewEntry(logical_path, physical_path, representation) orelse return .unknown;
+        const slot = entry.slot;
         const now = Io.Timestamp.now(self.io, .awake);
         const now_ms = timestampMilliseconds(now);
         if (now_ms >= slot.revalidate_after_ms.load(.monotonic)) {
             try self.refresh(root, slot, now, now_ms);
         }
         return @enumFromInt(slot.availability.load(.monotonic));
+    }
+
+    fn getOrCreateViewEntry(
+        self: *CacheView,
+        logical_path: []const u8,
+        physical_path: []const u8,
+        representation: Representation,
+    ) !?*ViewEntry {
+        const lookup = CacheKey{ .path = logical_path, .representation = representation };
+        if (self.entries.getPtr(lookup)) |entry| return entry;
+        const slot = try self.cache.getOrCreateSlot(
+            self.io,
+            logical_path,
+            physical_path,
+            representation,
+        ) orelse return null;
+        return try self.viewEntry(slot);
     }
 
     fn rangeResponse(
