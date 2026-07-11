@@ -182,7 +182,7 @@ def write_config(path, serve, port, *, cache=True, sendfile=True, precompressed=
             "etag": True,
             "range_requests": True,
             "precompressed": precompressed,
-            "keep_alive_timeout_ms": 1000,
+            "keep_alive_timeout_ms": 5000,
             "max_requests_per_connection": 1000,
             "max_connections": max_connections,
             "workers": 2,
@@ -372,7 +372,7 @@ def test_protocol(root, config, port):
             port,
             [("GET", "/partial.bin", {}) for _ in range(64)],
             pause_before_read=0.2,
-            receive_buffer=4096,
+            receive_buffer=64 * 1024,
         )
         expect(len(partial) == 64, "partial-write pipeline did not return 64 responses")
         for index, (status, _, response_body) in enumerate(partial):

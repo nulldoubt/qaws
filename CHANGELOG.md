@@ -2,6 +2,7 @@
 
 ### 0.2.7
 
+- Stabilized slow-reader integration coverage under host scheduling and memory pressure.
 - Made precompressed-sidecar integration checks deterministic across slow and fast hosts.
 - Deferred per-response cache generation retention until a socket actually applies backpressure.
 - Reused event-batch time and skipped range selection for ordinary cached requests.
